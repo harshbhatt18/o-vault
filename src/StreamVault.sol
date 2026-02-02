@@ -52,7 +52,7 @@ contract StreamVault is ERC4626, ReentrancyGuard {
     IYieldSource[] public yieldSources;
     address public operator;
     address public feeRecipient;
-    uint256 public performanceFeeBps; // e.g. 1000 = 10%
+    uint256 public immutable performanceFeeBps; // e.g. 1000 = 10%
 
     uint256 public currentEpochId;
     uint256 public totalPendingShares; // shares burned but not yet settled
@@ -507,6 +507,85 @@ contract StreamVault is ERC4626, ReentrancyGuard {
         lastEmaUpdateTimestamp = block.timestamp;
 
         emit EmaUpdated(emaTotalAssets, spot);
+    }
+
+    // ─── Batch Operations ─────────────────────────────────────────────
+
+    /// @notice Claim withdrawals from multiple settled epochs in a single transaction.
+    /// @param epochIds Array of epoch IDs to claim from.
+    function batchClaimWithdrawals(uint256[] calldata epochIds) external nonReentrant {
+        uint256 len = epochIds.length;
+        uint256 totalPayout;
+
+        for (uint256 i; i < len; ++i) {
+            uint256 epochId = epochIds[i];
+            Epoch storage epoch = epochs[epochId];
+            if (epoch.status != EpochStatus.SETTLED) revert EpochNotSettled();
+
+            WithdrawRequest storage req = withdrawRequests[epochId][msg.sender];
+            if (req.shares == 0) revert NoRequestInEpoch();
+
+            uint256 userShares = req.shares;
+            req.shares = 0;
+
+            uint256 payout = userShares.mulDiv(epoch.totalAssetsOwed, epoch.totalSharesBurned, Math.Rounding.Floor);
+
+            epoch.totalAssetsClaimed += payout;
+            totalPayout += payout;
+
+            emit WithdrawalClaimed(msg.sender, epochId, payout);
+        }
+
+        totalClaimableAssets -= totalPayout;
+        IERC20(asset()).safeTransfer(msg.sender, totalPayout);
+    }
+
+    // ─── View Functions ──────────────────────────────────────────────────
+
+    /// @notice Get a user's withdraw request for a specific epoch.
+    /// @return shares The number of shares the user burned in this epoch.
+    function getUserWithdrawRequest(uint256 epochId, address user) external view returns (uint256 shares) {
+        shares = withdrawRequests[epochId][user].shares;
+    }
+
+    /// @notice Get full epoch info.
+    /// @return status The epoch status (0=OPEN, 1=SETTLED).
+    /// @return totalSharesBurned Total shares burned by all requestors.
+    /// @return totalAssetsOwed Total USDC owed (set at settlement).
+    /// @return totalAssetsClaimed Total USDC already claimed.
+    function getEpochInfo(uint256 epochId)
+        external
+        view
+        returns (EpochStatus status, uint256 totalSharesBurned, uint256 totalAssetsOwed, uint256 totalAssetsClaimed)
+    {
+        Epoch storage epoch = epochs[epochId];
+        return (epoch.status, epoch.totalSharesBurned, epoch.totalAssetsOwed, epoch.totalAssetsClaimed);
+    }
+
+    /// @notice Get the balance of every registered yield source.
+    /// @return balances Array of balances, one per yield source (same order as yieldSources).
+    function getAllYieldSourceBalances() external view returns (uint256[] memory balances) {
+        uint256 len = yieldSources.length;
+        balances = new uint256[](len);
+        for (uint256 i; i < len; ++i) {
+            balances[i] = yieldSources[i].balance();
+        }
+    }
+
+    /// @notice Get the address of every registered yield source.
+    /// @return sources Array of addresses, one per yield source.
+    function getAllYieldSources() external view returns (address[] memory sources) {
+        uint256 len = yieldSources.length;
+        sources = new address[](len);
+        for (uint256 i; i < len; ++i) {
+            sources[i] = address(yieldSources[i]);
+        }
+    }
+
+    /// @notice Current idle balance available for deployment (excluding claimable).
+    function idleBalance() external view returns (uint256) {
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        return idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
     }
 
     // ─── Admin Functions ────────────────────────────────────────────────

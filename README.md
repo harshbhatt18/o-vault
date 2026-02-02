@@ -305,6 +305,37 @@ vault.claimWithdrawal(epochId);
 
 Settled epochs persist indefinitely — there is no deadline to claim.
 
+**Batch Claim.** Users with requests across multiple settled epochs can claim them all in a single transaction:
+
+```solidity
+uint256[] memory epochIds = new uint256[](3);
+epochIds[0] = 0;
+epochIds[1] = 1;
+epochIds[2] = 2;
+vault.batchClaimWithdrawals(epochIds);
+```
+
+### View Functions
+
+Convenience view functions for frontend integration:
+
+```solidity
+// Get a user's withdraw request for a specific epoch
+vault.getUserWithdrawRequest(epochId, userAddress);
+
+// Get full epoch info (status, sharesBurned, assetsOwed, assetsClaimed)
+vault.getEpochInfo(epochId);
+
+// Get all yield source balances at once
+uint256[] memory balances = vault.getAllYieldSourceBalances();
+
+// Get all yield source addresses
+address[] memory sources = vault.getAllYieldSources();
+
+// Current idle balance available for deployment (excludes claimable)
+vault.idleBalance();
+```
+
 ### Operator Flow: Capital Deployment
 
 The operator manages yield allocation across registered sources:
@@ -379,6 +410,7 @@ assetsOwed = burnedShares * emaTotalAssets / (totalSupply + totalPendingShares)
 - **Actual-amount transfers**: both Aave and Morpho adapters measure real balance changes, not requested amounts
 - **`onlyVault` guards** on all yield source adapters
 - **Disabled sync withdrawals**: `withdraw()`, `redeem()`, `maxWithdraw()`, `maxRedeem()`, `previewWithdraw()`, `previewRedeem()` all return 0 or revert
+- **Batch claim reentrancy guard**: `batchClaimWithdrawals()` is protected by `nonReentrant`, preventing callback attacks from malicious ERC-20 tokens during multi-epoch claims
 
 ---
 
@@ -408,9 +440,26 @@ forge test -vv
 forge snapshot
 ```
 
+### Static Analysis (Slither)
+
+```shell
+slither . --filter-paths "lib/,test/" --exclude naming-convention,pragma,solc-version,assembly
+```
+
+Slither runs against the production contracts (`src/`) with test and library files excluded. Results after triage:
+
+| Finding | Verdict | Rationale |
+| --- | --- | --- |
+| `performanceFeeBps` should be immutable | **Fixed** | Changed to `immutable` — only set in constructor |
+| Costly loop in `batchClaimWithdrawals` | **Fixed** | Accumulated `totalPayout`, single `totalClaimableAssets` write + `safeTransfer` after loop |
+| `incorrect-equality` (`== 0` checks) | Accepted | Safe early-return guards, not control-flow equality |
+| `reentrancy-no-eth` on `settleEpoch` | Accepted | Protected by `nonReentrant` modifier |
+| `calls-inside-a-loop` (yield sources) | Accepted | By design — capped at 20 sources with `MAX_YIELD_SOURCES` |
+| `timestamp` dependency | Accepted | Intentional use of `block.timestamp` for fee accrual and EMA timing |
+
 ### Test Suite
 
-91 tests across 10 focused test contracts, all inheriting from a shared `StreamVaultTestBase` harness that wires up a MockERC20, StreamVault, and MockYieldSource with standard parameters.
+129 tests across 14 test contracts in 2 test files, all inheriting from a shared `StreamVaultTestBase` harness that wires up a MockERC20, StreamVault, and MockYieldSource with standard parameters.
 
 | Test Contract | Tests | What It Covers |
 | --- | --- | --- |
@@ -424,11 +473,18 @@ forge snapshot
 | `Admin_Test` | 11 | All `onlyOperator` guards on every restricted function, `setOperator` zero-address revert, smoothing period bounds |
 | `Invariant_Test` | 6 | `totalAssets == idle + deployed - claimable` identity, roundtrip value preservation (deposit-withdraw <= deposit), inflation attack mitigation, multi-epoch claim, empty epoch settlement |
 | `Fuzz_Test` | 6 | Fuzzed deposit (1 USDC–100M USDC) always mints non-zero shares, fuzzed deposit-withdraw roundtrip never returns more than deposited, EMA floor holds under arbitrary donation sizes, management fee proportional to time, settlement never owes more than totalAssets |
+| `StatefulInvariant_Test` | 6 | **True Foundry invariant tests** with a `VaultHandler` that randomly sequences deposit, requestWithdraw, settleEpoch, claimWithdrawal, deployToYield, withdrawFromYield, harvestYield, and warpTime across 5 actors over 128k calls per invariant. Checks: totalAssets accounting identity, EMA floor, fee share bounds, claimable <= gross, epoch claimed <= owed, pending shares consistency |
+| `Reentrancy_Test` | 2 | Malicious `ReentrantERC20` attempts reentrancy during `claimWithdrawal` (transfer callback) and `deposit` (transferFrom callback) — both blocked by `ReentrancyGuard` |
+| `ERC4626Compliance_Test` | 21 | Full ERC-4626 spec compliance: `asset()`, `totalAssets()`, `convertToShares/Assets`, `maxDeposit/Mint/Withdraw/Redeem`, `previewDeposit/Mint`, deposit to different receiver, mint exact preview, roundtrip share-to-asset preservation, fuzzed preview==actual, fuzzed monotonicity |
+| `ViewAndBatch_Test` | 8 | `getUserWithdrawRequest`, `getEpochInfo`, `getAllYieldSourceBalances`, `getAllYieldSources`, `idleBalance` (including claimable exclusion), `batchClaimWithdrawals` across multiple epochs, revert on unsettled/no-request |
 
 ### Test Design Patterns
 
 - **Abstract base harness** (`StreamVaultTestBase`) deploys all contracts and registers the yield source in `setUp()`. Shared helpers (`_mintAndDeposit`, `_deployToYield`, `_warpAndAccrue`) keep individual tests concise.
 - **One contract per feature area** using inheritance — keeps test names self-documenting in forge output and allows per-area `setUp()` overrides.
+- **True stateful invariant testing** with a `VaultHandler` contract that Foundry randomly sequences — 8 entry points, 5 actors, 128k calls per invariant, 6 invariant properties checked after every call.
+- **Reentrancy proof** via a custom `ReentrantERC20` that attempts callback attacks during `transfer`/`transferFrom` — verifying `nonReentrant` blocks all re-entry paths.
+- **ERC-4626 conformance** — 21 tests covering every MUST/SHOULD in the spec, including fuzzed preview accuracy and monotonicity.
 - **`vm.expectRevert(Selector)`** for all custom error reverts — tests the exact error, not just that it reverted.
 - **`assertApproxEqRel`** for tolerance-based assertions on fee math and roundtrip value preservation where management fee accrual introduces expected drift.
 - **`bound()`** for fuzz input constraining to realistic USDC ranges.
