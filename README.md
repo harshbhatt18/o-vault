@@ -104,18 +104,145 @@ Fees are charged on net assets (excluding funds already owed to settled withdraw
 
 ## Architecture
 
+### System Overview
+
+```mermaid
+graph TB
+    subgraph Actors
+        U[👤 Depositor]
+        O[🔧 Operator / Keeper]
+        F[💰 Fee Recipient]
+    end
+
+    subgraph StreamVault ["StreamVault (ERC-4626)"]
+        direction TB
+        D[Deposit Engine<br/>mint shares instantly]
+        WQ[Epoch Withdrawal Queue<br/>request → settle → claim]
+        EMA[EMA-Smoothed NAV<br/>anti-donation oracle]
+        MF[Continuous Mgmt Fee<br/>time-proportional dilution]
+        PF[Per-Source HWM<br/>performance fees]
+        IDLE[(Idle Balance<br/>USDC)]
+    end
+
+    subgraph YieldSources ["Yield Source Adapters (IYieldSource)"]
+        AAVE[Aave V3 Adapter<br/>aToken rebasing]
+        MORPHO[Morpho Adapter<br/>ERC-4626 shares]
+        MOCK[Mock Source<br/>configurable rate]
+    end
+
+    U -->|"deposit(assets)"| D
+    U -->|"requestWithdraw(shares)"| WQ
+    U -->|"claimWithdrawal(epochId)"| WQ
+    D -->|svUSDC shares| U
+
+    O -->|"deployToYield(idx, amt)"| IDLE
+    O -->|"withdrawFromYield(idx, amt)"| IDLE
+    O -->|"settleEpoch()"| WQ
+    O -->|"harvestYield()"| PF
+
+    IDLE -->|USDC| AAVE
+    IDLE -->|USDC| MORPHO
+    IDLE -->|USDC| MOCK
+    AAVE -->|USDC| IDLE
+    MORPHO -->|USDC| IDLE
+    MOCK -->|USDC| IDLE
+
+    MF -->|fee shares| F
+    PF -->|fee shares| F
+
+    style StreamVault fill:#1a1a2e,stroke:#e94560,color:#fff
+    style YieldSources fill:#0f3460,stroke:#16213e,color:#fff
+    style Actors fill:#16213e,stroke:#e94560,color:#fff
 ```
-                    ┌──────────────────┐
-                    │   StreamVault    │
-                    │   (ERC-4626)     │
-                    └───────┬──────────┘
-                            │
-              ┌─────────────┼─────────────┐
-              │             │             │
-        ┌─────┴─────┐ ┌────┴────┐ ┌──────┴──────┐
-        │  Aave V3  │ │ Morpho  │ │    Mock     │
-        │  Adapter  │ │ Adapter │ │   Source    │
-        └───────────┘ └─────────┘ └─────────────┘
+
+### Capital Flow — Deposit to Yield to Withdrawal
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Vault as StreamVault
+    participant YS as Yield Source
+
+    Note over Vault: _accrueManagementFee()<br/>_updateEma()
+
+    User->>Vault: deposit(1000 USDC)
+    Vault-->>User: mint svUSDC shares
+    Note over Vault: USDC sits in idle balance
+
+    Vault->>Vault: Operator: deployToYield(idx, 800 USDC)
+    Vault->>YS: transfer 800 USDC
+    Note over YS: Yield accrues over time...
+
+    Vault->>Vault: Operator: harvestYield()
+    Note over Vault: Measure profit per source<br/>Mint perf fee shares (HWM gated)
+
+    User->>Vault: requestWithdraw(shares)
+    Note over Vault: Shares burned immediately<br/>User enters epoch queue
+
+    Vault->>Vault: Operator: settleEpoch()
+    Note over Vault: Snapshot EMA exchange rate<br/>Calculate pro-rata USDC owed
+    Vault->>YS: Pull funds if idle < owed (waterfall)
+    YS-->>Vault: Return USDC
+
+    User->>Vault: claimWithdrawal(epochId)
+    Vault-->>User: Transfer owed USDC
+```
+
+### Withdrawal Epoch State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> OPEN: Vault deployed /<br/>previous epoch settled
+
+    OPEN --> OPEN: requestWithdraw(shares)<br/>burns shares, adds to queue
+
+    OPEN --> SETTLED: settleEpoch()<br/>after MIN_EPOCH_DURATION (5 min)
+
+    SETTLED --> SETTLED: claimWithdrawal(epochId)<br/>user collects USDC
+
+    SETTLED --> [*]: All claims collected
+
+    note right of OPEN
+        Only ONE epoch open at a time.
+        Users enter the current epoch's queue.
+    end note
+
+    note right of SETTLED
+        Settled epochs persist forever.
+        No deadline to claim.
+        New epoch opens immediately.
+    end note
+```
+
+### Internal Vault Modules
+
+```mermaid
+graph LR
+    subgraph Every Interaction
+        direction TB
+        A["1. _accrueManagementFee()"] --> B["2. _updateEma()"]
+        B --> C["3. Main Logic"]
+    end
+
+    subgraph EMA Engine
+        SPOT[/"spot = totalAssets()"/]
+        INTERP["ema += (spot - ema)<br/>× elapsed / smoothingPeriod"]
+        FLOOR["floor: ema ≥ 95% of spot"]
+        SNAP["first deposit: ema = spot"]
+    end
+
+    subgraph Fee Engine
+        MGMT["Management Fee<br/>feeAssets = netAUM × bps × Δt / year"]
+        PERF["Performance Fee<br/>per-source HWM gating"]
+        MINT["_mint(feeRecipient, feeShares)<br/>priced via EMA"]
+    end
+
+    B --> EMA Engine
+    A --> Fee Engine
+
+    style Every Interaction fill:#1a1a2e,stroke:#e94560,color:#fff
+    style EMA Engine fill:#0f3460,stroke:#16213e,color:#fff
+    style Fee Engine fill:#0f3460,stroke:#16213e,color:#fff
 ```
 
 ### Contracts
@@ -313,22 +440,6 @@ forge snapshot
 - **`assertApproxEqRel`** for tolerance-based assertions on fee math and roundtrip value preservation where management fee accrual introduces expected drift.
 - **`bound()`** for fuzz input constraining to realistic USDC ranges.
 - **EMA tests account for the deposit-timing subtlety**: `_updateEma()` runs before `super._deposit()` transfers tokens, so spot at update time differs from spot after. Floor assertions use `spotBeforeDeposit` to match what the contract actually sees.
-
----
-
-## Kiln Mapping
-
-| StreamVault | Kiln Equivalent |
-| --- | --- |
-| `requestWithdraw()` | Railnet STEAM query (PENDING state) |
-| `settleEpoch()` | Operator batch settlement (SETTLED state) |
-| Epoch batching | Gas-efficient batch settlement |
-| `claimWithdrawal()` | User collection post-settlement |
-| `IYieldSource` | Omnivault connector pattern (IConnector) |
-| `totalAssets()` override | idle + strategies - owed accounting |
-| `_decimalsOffset()` | OZ virtual shares for inflation protection |
-| Performance fee as share mint | Kiln's FeeDispatcher pattern |
-| Multi-connector array | Omnivault multi-strategy deployment |
 
 ---
 
