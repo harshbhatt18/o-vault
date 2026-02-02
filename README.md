@@ -192,57 +192,50 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> OPEN: Vault deployed /<br/>previous epoch settled
+    [*] --> OPEN : Vault deployed / previous epoch settled
 
-    OPEN --> OPEN: requestWithdraw(shares)<br/>burns shares, adds to queue
+    OPEN --> OPEN : requestWithdraw(shares) — burns shares, adds to queue
 
-    OPEN --> SETTLED: settleEpoch()<br/>after MIN_EPOCH_DURATION (5 min)
+    OPEN --> SETTLED : settleEpoch() — after MIN_EPOCH_DURATION (5 min)
 
-    SETTLED --> SETTLED: claimWithdrawal(epochId)<br/>user collects USDC
+    SETTLED --> SETTLED : claimWithdrawal(epochId) — user collects USDC
 
-    SETTLED --> [*]: All claims collected
+    SETTLED --> [*] : All claims collected
 
-    note right of OPEN
-        Only ONE epoch open at a time.
-        Users enter the current epoch's queue.
-    end note
+    note right of OPEN : Only ONE epoch open at a time. Users enter the current epoch queue.
 
-    note right of SETTLED
-        Settled epochs persist forever.
-        No deadline to claim.
-        New epoch opens immediately.
-    end note
+    note right of SETTLED : Settled epochs persist forever. No deadline to claim. New epoch opens immediately.
 ```
 
 ### Internal Vault Modules
 
 ```mermaid
 graph LR
-    subgraph Every Interaction
+    subgraph EveryInteraction ["Every Interaction"]
         direction TB
         A["1. _accrueManagementFee()"] --> B["2. _updateEma()"]
         B --> C["3. Main Logic"]
     end
 
-    subgraph EMA Engine
+    subgraph EMAEngine ["EMA Engine"]
         SPOT[/"spot = totalAssets()"/]
-        INTERP["ema += (spot - ema)<br/>× elapsed / smoothingPeriod"]
-        FLOOR["floor: ema ≥ 95% of spot"]
+        INTERP["ema += (spot - ema) x elapsed / smoothingPeriod"]
+        FLOOR["floor: ema >= 95% of spot"]
         SNAP["first deposit: ema = spot"]
     end
 
-    subgraph Fee Engine
-        MGMT["Management Fee<br/>feeAssets = netAUM × bps × Δt / year"]
-        PERF["Performance Fee<br/>per-source HWM gating"]
-        MINT["_mint(feeRecipient, feeShares)<br/>priced via EMA"]
+    subgraph FeeEngine ["Fee Engine"]
+        MGMT["Management Fee: feeAssets = netAUM x bps x dt / year"]
+        PERF["Performance Fee: per-source HWM gating"]
+        MINT["_mint(feeRecipient, feeShares) priced via EMA"]
     end
 
-    B --> EMA Engine
-    A --> Fee Engine
+    B --> EMAEngine
+    A --> FeeEngine
 
-    style Every Interaction fill:#1a1a2e,stroke:#e94560,color:#fff
-    style EMA Engine fill:#0f3460,stroke:#16213e,color:#fff
-    style Fee Engine fill:#0f3460,stroke:#16213e,color:#fff
+    style EveryInteraction fill:#1a1a2e,stroke:#e94560,color:#fff
+    style EMAEngine fill:#0f3460,stroke:#16213e,color:#fff
+    style FeeEngine fill:#0f3460,stroke:#16213e,color:#fff
 ```
 
 ### Contracts
