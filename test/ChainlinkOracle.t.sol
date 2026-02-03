@@ -46,7 +46,7 @@ contract ChainlinkOracle_Test is Test {
         // Set price to $1.50 (1.5e8 in 8 decimals)
         mockFeed.setPrice(15e7);
 
-        (uint256 price, ) = oracle.getPrice();
+        (uint256 price,) = oracle.getPrice();
 
         // 1.5e8 normalized to 18 decimals = 1.5e18
         assertEq(price, 15e17, "Price should be 1.5e18 for $1.50");
@@ -129,7 +129,7 @@ contract ChainlinkOracle_Test is Test {
         MockChainlinkAggregator feed6 = new MockChainlinkAggregator(6, 1e6);
         ChainlinkOracle oracle6 = new ChainlinkOracle(address(feed6), USDC, STALENESS_THRESHOLD);
 
-        (uint256 price, ) = oracle6.getPrice();
+        (uint256 price,) = oracle6.getPrice();
 
         // 1e6 normalized to 18 decimals = 1e18
         assertEq(price, 1e18);
@@ -140,7 +140,7 @@ contract ChainlinkOracle_Test is Test {
         MockChainlinkAggregator feed18 = new MockChainlinkAggregator(18, 1e18);
         ChainlinkOracle oracle18 = new ChainlinkOracle(address(feed18), USDC, STALENESS_THRESHOLD);
 
-        (uint256 price, ) = oracle18.getPrice();
+        (uint256 price,) = oracle18.getPrice();
 
         assertEq(price, 1e18, "18-decimal feed should not be modified");
     }
@@ -153,7 +153,7 @@ contract ChainlinkOracle_Test is Test {
 
         mockFeed.setPrice(rawPrice);
 
-        (uint256 price, ) = oracle.getPrice();
+        (uint256 price,) = oracle.getPrice();
 
         // Verify normalization: price should be rawPrice * 1e10 (18-8=10)
         assertEq(price, uint256(rawPrice) * 1e10);

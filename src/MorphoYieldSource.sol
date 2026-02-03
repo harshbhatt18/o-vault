@@ -59,6 +59,32 @@ contract MorphoYieldSource is IYieldSource {
         return address(UNDERLYING_ASSET);
     }
 
+    // ─── CRE View Functions ─────────────────────────────────────────────
+
+    /// @notice Returns Morpho vault utilization.
+    /// @dev For MetaMorpho vaults, utilization = 1 - (idleAssets / totalAssets)
+    ///      Returns in basis points (10000 = 100% utilization / fully deployed).
+    function getMarketUtilization() external view returns (uint256 utilizationBps) {
+        uint256 totalAssets = MORPHO_VAULT.totalAssets();
+        if (totalAssets == 0) return 0;
+
+        // Idle assets are the underlying tokens held directly by the vault
+        uint256 idleAssets = UNDERLYING_ASSET.balanceOf(address(MORPHO_VAULT));
+
+        // Deployed = totalAssets - idle
+        uint256 deployed = totalAssets > idleAssets ? totalAssets - idleAssets : 0;
+
+        // Utilization = deployed / totalAssets
+        utilizationBps = (deployed * 10000) / totalAssets;
+    }
+
+    /// @notice Returns available liquidity we could withdraw right now.
+    /// @dev This considers both our share value and the vault's maxWithdraw limit.
+    function getAvailableLiquidity() external view returns (uint256) {
+        // maxWithdraw returns the maximum assets the owner can withdraw
+        return MORPHO_VAULT.maxWithdraw(address(this));
+    }
+
     function _onlyVault() internal view {
         if (msg.sender != VAULT) revert OnlyVault();
     }

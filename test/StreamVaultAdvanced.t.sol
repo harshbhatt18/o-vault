@@ -755,6 +755,7 @@ contract StreamVault_Pause_Test is Test {
         shares = vault.deposit(amount, user);
         vm.stopPrank();
     }
+
     function test_pause_onlyOperator() public {
         vm.prank(alice);
         vm.expectRevert(StreamVault.OnlyOperator.selector);
@@ -946,7 +947,10 @@ contract StreamVault_Drawdown_Test is Test {
 
     function test_drawdown_initialState() public view {
         assertEq(vault.maxDrawdownBps(), 1_000, "Default max drawdown should be 10%");
-        assertEq(vault.navHighWaterMark(), 1e18, "Initial HWM should be 1.0");
+        // HWM starts at 0 and gets set on first interaction (deposit).
+        // This avoids a bug where hardcoding 1e18 causes false circuit-breaker
+        // triggers for assets with non-18 decimals (e.g., USDC 6 decimals).
+        assertEq(vault.navHighWaterMark(), 0, "Initial HWM should be 0 (set on first interaction)");
     }
 
     function test_drawdown_setMaxDrawdown_onlyOperator() public {

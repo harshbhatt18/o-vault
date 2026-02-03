@@ -1,0 +1,17 @@
+{
+  "name": "streamvault-risk-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "postinstall": "bunx cre-setup"
+  },
+  "dependencies": {
+    "@chainlink/cre-sdk": "^1.0.0",
+    "viem": "^2.41.2"
+  },
+  "devDependencies": {
+    "@types/bun": "1.2.21"
+  }
+}

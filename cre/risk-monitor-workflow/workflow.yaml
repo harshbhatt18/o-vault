@@ -1,0 +1,29 @@
+# ==========================================================================
+# CRE WORKFLOW SETTINGS FILE
+# ==========================================================================
+# Workflow-specific settings for CRE CLI targets.
+# Each target defines user-workflow and workflow-artifacts groups.
+
+# ==========================================================================
+local-simulation:
+  user-workflow:
+    workflow-name: "streamvault-risk-monitor"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"
+
+# ==========================================================================
+staging-settings:
+  user-workflow:
+    workflow-name: "streamvault-risk-monitor-staging"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"
+
+# ==========================================================================
+production-settings:
+  user-workflow:
+    workflow-name: "streamvault-risk-monitor-prod"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"

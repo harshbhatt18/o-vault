@@ -9,6 +9,26 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 interface IPool {
     function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
     function withdraw(address asset, uint256 amount, address to) external returns (uint256);
+    function getReserveData(address asset)
+        external
+        view
+        returns (
+            uint256 configuration,
+            uint128 liquidityIndex,
+            uint128 currentLiquidityRate,
+            uint128 variableBorrowIndex,
+            uint128 currentVariableBorrowRate,
+            uint128 currentStableBorrowRate,
+            uint40 lastUpdateTimestamp,
+            uint16 id,
+            address aTokenAddress,
+            address stableDebtTokenAddress,
+            address variableDebtTokenAddress,
+            address interestRateStrategyAddress,
+            uint128 accruedToTreasury,
+            uint128 unbacked,
+            uint128 isolationModeTotalDebt
+        );
 }
 
 /// @title AaveV3YieldSource
@@ -63,6 +83,36 @@ contract AaveV3YieldSource is IYieldSource {
     /// @notice The underlying asset address.
     function asset() external view returns (address) {
         return address(UNDERLYING_ASSET);
+    }
+
+    // ─── CRE View Functions ─────────────────────────────────────────────
+
+    /// @notice Returns Aave pool utilization for the underlying asset.
+    /// @dev Utilization = totalDebt / (totalDebt + availableLiquidity)
+    ///      Returns in basis points (10000 = 100% utilization).
+    function getPoolUtilization() external view returns (uint256 utilizationBps) {
+        // Total liquidity available in the pool is the aToken total supply minus what's borrowed
+        // Available liquidity = underlying balance of the aToken contract
+        uint256 availableLiquidity = UNDERLYING_ASSET.balanceOf(address(A_TOKEN));
+
+        // Total aToken supply represents total deposits (available + borrowed)
+        uint256 totalDeposits = A_TOKEN.totalSupply();
+
+        if (totalDeposits == 0) return 0;
+
+        // Borrowed = totalDeposits - availableLiquidity
+        uint256 totalBorrowed = totalDeposits > availableLiquidity ? totalDeposits - availableLiquidity : 0;
+
+        // Utilization = borrowed / totalDeposits
+        utilizationBps = (totalBorrowed * 10000) / totalDeposits;
+    }
+
+    /// @notice Returns available liquidity we could withdraw right now.
+    /// @dev This is the minimum of our balance and the pool's available liquidity.
+    function getAvailableLiquidity() external view returns (uint256) {
+        uint256 ourBalance = A_TOKEN.balanceOf(address(this));
+        uint256 poolLiquidity = UNDERLYING_ASSET.balanceOf(address(A_TOKEN));
+        return ourBalance < poolLiquidity ? ourBalance : poolLiquidity;
     }
 
     function _onlyVault() internal view {

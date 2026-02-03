@@ -10,5 +10,19 @@ out/
 # Docs
 docs/
 
-# Dotenv file
+# Dotenv files (may contain private keys)
 .env
+**/.env
+
+# Node modules
+node_modules/
+
+# CRE workflow build artifacts
+cre/**/dist/
+cre/**/tmp.*
+
+# Claude Code local settings
+.claude/
+
+# OS files
+.DS_Store

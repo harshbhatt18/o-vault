@@ -1,0 +1,9 @@
+{
+  "schedule": "0 */5 * * * *",
+  "chainSelectorName": "ethereum-testnet-sepolia-base-1",
+  "isTestnet": true,
+  "vaultAddress": "0x4c088bc94a09a3B11EB5E077eAd7900afE2FF690",
+  "aaveSourceAddress": "0xd3eDA3F0FFD0889624a700CD712C31234Fb9Cbb0",
+  "morphoSourceAddress": "0xFA5F8510aaEA7589Cf24d63e2aaDc0b8784B6e35",
+  "gasLimit": "500000"
+}

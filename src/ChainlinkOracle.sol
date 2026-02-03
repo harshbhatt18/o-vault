@@ -43,7 +43,7 @@ contract ChainlinkOracle is IPriceOracle {
     /// @return price The price in 18 decimal precision.
     /// @return updatedAt Timestamp of the last price update.
     function getPrice() external view override returns (uint256 price, uint256 updatedAt) {
-        (uint80 roundId, int256 answer, , uint256 _updatedAt, uint80 answeredInRound) = FEED.latestRoundData();
+        (uint80 roundId, int256 answer,, uint256 _updatedAt, uint80 answeredInRound) = FEED.latestRoundData();
 
         // Validate round completeness
         if (answeredInRound < roundId) revert InvalidRound();
@@ -67,13 +67,13 @@ contract ChainlinkOracle is IPriceOracle {
 
     /// @notice Check if the oracle price is stale.
     function isStale() external view override returns (bool) {
-        (, , , uint256 updatedAt, ) = FEED.latestRoundData();
+        (,,, uint256 updatedAt,) = FEED.latestRoundData();
         return block.timestamp - updatedAt > STALENESS_THRESHOLD;
     }
 
     /// @notice Get the raw Chainlink price without normalization (for debugging).
     function getRawPrice() external view returns (int256 answer, uint256 updatedAt) {
-        (, answer, , updatedAt, ) = FEED.latestRoundData();
+        (, answer,, updatedAt,) = FEED.latestRoundData();
     }
 
     /// @dev Normalize price from feed decimals to 18 decimals.

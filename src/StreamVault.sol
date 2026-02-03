@@ -9,13 +9,16 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IYieldSource} from "./IYieldSource.sol";
+import {IReceiver} from "./interfaces/IReceiver.sol";
+import {RiskModel} from "./libraries/RiskModel.sol";
 
 /// @title StreamVault
 /// @notice ERC-4626 vault with async (epoch-based) withdrawals, multi-connector yield sources,
 ///         EMA-smoothed NAV for manipulation-resistant settlement, and continuous management fee accrual.
 ///         Deposits are instant. Withdrawals go through a three-step process:
 ///         requestWithdraw → settleEpoch → claimWithdrawal.
-contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
+///         Implements IReceiver for Chainlink CRE risk oracle integration.
+contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
     using SafeERC20 for IERC20;
     using Math for uint256;
 
@@ -80,10 +83,25 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
     uint256 public navHighWaterMark; // highest NAV per share (18 decimals)
     uint256 public maxDrawdownBps; // max allowed drawdown before auto-pause (e.g., 1000 = 10%)
 
+    // ─── CRE Risk Oracle State ──────────────────────────────────────────
+
+    address public chainlinkForwarder; // Chainlink CRE KeystoneForwarder address
+    RiskModel.RiskSnapshot public latestRiskSnapshot; // Latest risk snapshot from CRE
+    uint256 public lcrFloorBps; // Minimum LCR (e.g., 10000 = 100%), enforced in deployToYield()
+
+    /// @notice Action type constants for onReport dispatch
+    uint8 public constant ACTION_UPDATE_RISK_PARAMS = 0;
+    uint8 public constant ACTION_DEFENSIVE_REBALANCE = 1;
+    uint8 public constant ACTION_EMERGENCY_PAUSE = 2;
+    uint8 public constant ACTION_SETTLE_EPOCH = 3;
+    uint8 public constant ACTION_HARVEST_YIELD = 4;
+
     // ─── Mappings ───────────────────────────────────────────────────────
 
     mapping(uint256 => Epoch) public epochs;
     mapping(uint256 => mapping(address => WithdrawRequest)) public withdrawRequests;
+    mapping(address => RiskModel.SourceRiskParams) public sourceRiskParams; // source address → CRE risk params
+    mapping(address => bool) public isRegisteredSource; // source address → is registered
 
     // ─── Events ─────────────────────────────────────────────────────────
 
@@ -106,6 +124,12 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
     event DrawdownCircuitBreaker(uint256 currentNav, uint256 highWaterMark, uint256 drawdownBps);
     event NavHighWaterMarkUpdated(uint256 newHighWaterMark);
     event MaxDrawdownUpdated(uint256 newMaxDrawdownBps);
+    event ChainlinkForwarderUpdated(address indexed forwarder);
+    event RiskParamsUpdated(address indexed source, RiskModel.SourceRiskParams params);
+    event RiskSnapshotUpdated(RiskModel.RiskSnapshot snapshot);
+    event DefensiveRebalanceTriggered(address indexed source, uint256 amountWithdrawn);
+    event EmergencyPauseTriggered(uint8 severity);
+    event LCRFloorUpdated(uint256 newFloorBps);
 
     // ─── Errors ─────────────────────────────────────────────────────────
 
@@ -125,11 +149,25 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
     error InvalidSmoothingPeriod();
     error EpochTooYoung();
     error InvalidDrawdownThreshold();
+    error OnlyForwarder();
+    error InvalidAction(uint8 action);
+    error ArrayLengthMismatch();
+    error UnknownSource(address source);
+    error HaircutTooHigh();
+    error InvalidConcentration();
+    error LCRBreached(uint256 actual, uint256 floor);
+    error ConcentrationBreached(address source);
 
     // ─── Modifiers ──────────────────────────────────────────────────────
 
     modifier onlyOperator() {
         _onlyOperator();
+        _;
+    }
+
+    /// @notice Allows either the trusted operator or the CRE Forwarder
+    modifier onlyOperatorOrCRE() {
+        if (msg.sender != operator && msg.sender != chainlinkForwarder) revert OnlyOperator();
         _;
     }
 
@@ -165,7 +203,12 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
 
         // Initialize drawdown protection with default 10% threshold
         maxDrawdownBps = DEFAULT_MAX_DRAWDOWN_BPS;
-        navHighWaterMark = 1e18; // 1.0 in 18-decimal precision
+        // Initialize HWM to match actual NAV at construction.
+        // At construction: totalSupply() = 0, so navPerShare() returns 1e18.
+        // But after first deposit, NAV depends on asset decimals + decimalsOffset.
+        // For USDC (6 dec) + offset 3: NAV ≈ 1e15, not 1e18.
+        // Set to 0 so the first _checkDrawdown() call sets it to the real NAV.
+        navHighWaterMark = 0;
     }
 
     // ─── ERC-4626 Overrides ─────────────────────────────────────────────
@@ -197,7 +240,12 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
 
     /// @notice Override to accrue management fee, update EMA, and snap EMA on first deposit.
     /// @dev Pausing blocks deposits to protect users if a yield source is compromised.
-    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override nonReentrant whenNotPaused {
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
+        internal
+        override
+        nonReentrant
+        whenNotPaused
+    {
         _accrueManagementFee();
         _updateEma();
 
@@ -252,6 +300,8 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
         if (yieldSources.length >= MAX_YIELD_SOURCES) revert TooManyYieldSources();
 
         yieldSources.push(source);
+        isRegisteredSource[address(source)] = true;
+        sourceRiskParams[address(source)] = RiskModel.defaultParams();
         emit YieldSourceAdded(yieldSources.length - 1, address(source));
     }
 
@@ -262,6 +312,10 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
 
         IYieldSource source = yieldSources[sourceIndex];
         if (source.balance() != 0) revert SourceNotEmpty();
+
+        // Clear CRE risk tracking
+        isRegisteredSource[address(source)] = false;
+        delete sourceRiskParams[address(source)];
 
         yieldSources[sourceIndex] = yieldSources[len - 1];
         yieldSources.pop();
@@ -304,56 +358,7 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
     /// @notice Settle the current epoch using EMA-smoothed NAV for manipulation resistance.
     ///         Pulls from yield sources (waterfall) if idle funds are insufficient.
     function settleEpoch() external onlyOperator nonReentrant {
-        uint256 epochId = currentEpochId;
-        Epoch storage epoch = epochs[epochId];
-
-        if (epoch.status == EpochStatus.SETTLED) revert EpochAlreadySettled();
-        if (block.timestamp - epochOpenedAt < MIN_EPOCH_DURATION) revert EpochTooYoung();
-
-        _accrueManagementFee();
-        _updateEma();
-        _checkDrawdown();
-
-        uint256 burnedShares = epoch.totalSharesBurned;
-
-        // Use EMA instead of spot totalAssets for manipulation resistance.
-        // effectiveSupply reconstructs the pre-burn denominator.
-        uint256 currentTotalAssets = emaTotalAssets;
-        uint256 effectiveSupply = totalSupply() + totalPendingShares;
-        uint256 assetsOwed =
-            (effectiveSupply > 0) ? burnedShares.mulDiv(currentTotalAssets, effectiveSupply, Math.Rounding.Floor) : 0;
-
-        // Pull from yield sources if idle funds are insufficient (waterfall)
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
-        uint256 available = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
-
-        if (assetsOwed > available) {
-            uint256 remaining = assetsOwed - available;
-            uint256 len = yieldSources.length;
-
-            for (uint256 i; i < len && remaining > 0; ++i) {
-                uint256 srcBal = yieldSources[i].balance();
-                if (srcBal == 0) continue;
-
-                uint256 pull = remaining > srcBal ? srcBal : remaining;
-                yieldSources[i].withdraw(pull);
-                remaining -= pull;
-
-                emit WithdrawnFromYield(i, pull);
-            }
-
-            if (remaining > 0) revert InsufficientLiquidity();
-        }
-
-        epoch.totalAssetsOwed = assetsOwed;
-        epoch.status = EpochStatus.SETTLED;
-        totalPendingShares -= burnedShares;
-        totalClaimableAssets += assetsOwed;
-
-        currentEpochId = epochId + 1;
-        epochOpenedAt = block.timestamp;
-
-        emit EpochSettled(epochId, assetsOwed);
+        _settleCurrentEpoch();
     }
 
     // ─── Async Withdrawal: Step 3 — Claim ──────────────────────────────
@@ -382,6 +387,7 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
     // ─── Operator Functions ─────────────────────────────────────────────
 
     /// @notice Deploy idle USDC to a specific yield source.
+    /// @dev Enforces LCR floor and concentration limits using CRE-updated risk params.
     function deployToYield(uint256 sourceIndex, uint256 amount) external onlyOperator nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (sourceIndex >= yieldSources.length) revert InvalidSourceIndex();
@@ -392,6 +398,22 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
         IYieldSource source = yieldSources[sourceIndex];
         IERC20(asset()).forceApprove(address(source), amount);
         source.deposit(amount);
+
+        // POST-CONDITION: LCR must remain above floor after deployment
+        if (lcrFloorBps > 0) {
+            uint256 lcrAfter = this.computeLCR();
+            if (lcrAfter < lcrFloorBps) revert LCRBreached(lcrAfter, lcrFloorBps);
+        }
+
+        // POST-CONDITION: Concentration limit must not be exceeded
+        RiskModel.SourceRiskParams memory params = sourceRiskParams[address(source)];
+        if (params.maxConcentrationBps > 0) {
+            uint256 sourceBalanceAfter = source.balance();
+            uint256 total = totalAssets();
+            if (RiskModel.isConcentrationBreached(sourceBalanceAfter, total, params.maxConcentrationBps)) {
+                revert ConcentrationBreached(address(source));
+            }
+        }
 
         emit DeployedToYield(sourceIndex, amount);
     }
@@ -645,6 +667,97 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
         return idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
     }
 
+    // ─── CRE View Functions ─────────────────────────────────────────────
+
+    /// @notice Returns deployed balance for a specific yield source by address.
+    /// @param source The yield source address.
+    /// @return balance The current balance deployed to this source.
+    function getSourceBalance(address source) external view returns (uint256 balance) {
+        uint256 len = yieldSources.length;
+        for (uint256 i; i < len; ++i) {
+            if (address(yieldSources[i]) == source) {
+                return yieldSources[i].balance();
+            }
+        }
+        return 0;
+    }
+
+    /// @notice Returns all registered yield source addresses.
+    /// @return sources Array of yield source addresses.
+    function getYieldSources() external view returns (address[] memory sources) {
+        uint256 len = yieldSources.length;
+        sources = new address[](len);
+        for (uint256 i; i < len; ++i) {
+            sources[i] = address(yieldSources[i]);
+        }
+    }
+
+    /// @notice Returns current risk parameters for a source.
+    /// @param source The yield source address.
+    /// @return params The source's CRE-updated risk parameters.
+    function getSourceRiskParams(address source) external view returns (RiskModel.SourceRiskParams memory params) {
+        params = sourceRiskParams[source];
+    }
+
+    /// @notice Returns the latest risk snapshot from CRE.
+    /// @return snapshot The most recent risk snapshot.
+    function getLatestRiskSnapshot() external view returns (RiskModel.RiskSnapshot memory snapshot) {
+        snapshot = latestRiskSnapshot;
+    }
+
+    /// @notice Returns pending withdrawal amount for current epoch.
+    /// @return pending Total shares pending settlement in current epoch.
+    function getPendingEpochWithdrawals() external view returns (uint256 pending) {
+        pending = epochs[currentEpochId].totalSharesBurned;
+    }
+
+    /// @notice Returns epoch timing info.
+    /// @return epochId Current epoch ID.
+    /// @return startTime When current epoch started.
+    /// @return minDuration Minimum epoch duration before settlement.
+    function getCurrentEpochInfo() external view returns (uint256 epochId, uint256 startTime, uint256 minDuration) {
+        epochId = currentEpochId;
+        startTime = epochOpenedAt;
+        minDuration = MIN_EPOCH_DURATION;
+    }
+
+    /// @notice Computes current on-chain LCR using stored risk params.
+    /// @dev HQLA = Σ(sourceBalance * (10000 - haircutBps)) / 10000 + idleBalance
+    ///      Outflows = Σ(sourceBalance * stressOutflowBps) / 10000 + pendingWithdrawals
+    ///      LCR = HQLA * 10000 / Outflows
+    /// @return lcrBps The LCR in basis points (10000 = 100%).
+    function computeLCR() external view returns (uint256 lcrBps) {
+        uint256 len = yieldSources.length;
+        uint256 totalHQLA;
+        uint256 totalStressedOutflows;
+
+        for (uint256 i; i < len; ++i) {
+            address sourceAddr = address(yieldSources[i]);
+            uint256 bal = yieldSources[i].balance();
+            RiskModel.SourceRiskParams memory params = sourceRiskParams[sourceAddr];
+
+            // HQLA contribution = balance * (1 - haircut)
+            totalHQLA += RiskModel.computeSourceHQLA(bal, params.liquidityHaircutBps);
+            // Stressed outflow contribution
+            totalStressedOutflows += RiskModel.computeSourceStressedOutflow(bal, params.stressOutflowBps);
+        }
+
+        // Add idle balance (no haircut on idle)
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 availableIdle = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
+        totalHQLA += availableIdle;
+
+        // Add pending withdrawals to outflows
+        totalStressedOutflows += epochs[currentEpochId].totalSharesBurned;
+
+        // Compute LCR (avoid division by zero)
+        if (totalStressedOutflows == 0) {
+            return type(uint256).max; // Infinite LCR if no outflows
+        }
+
+        lcrBps = (totalHQLA * RiskModel.BPS) / totalStressedOutflows;
+    }
+
     // ─── Admin Functions ────────────────────────────────────────────────
 
     /// @notice Update the operator address.
@@ -706,6 +819,204 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
         uint256 currentNav = navPerShare();
         navHighWaterMark = currentNav;
         emit NavHighWaterMarkUpdated(currentNav);
+    }
+
+    /// @notice Set the Chainlink CRE Forwarder address.
+    /// @dev Only callable by operator. The Forwarder is the only address that can call onReport().
+    /// @param forwarder The KeystoneForwarder contract address for this network.
+    function setChainlinkForwarder(address forwarder) external onlyOperator {
+        if (forwarder == address(0)) revert ZeroAddress();
+        chainlinkForwarder = forwarder;
+        emit ChainlinkForwarderUpdated(forwarder);
+    }
+
+    /// @notice Set the minimum LCR floor for deployment operations.
+    /// @param _lcrFloorBps Minimum LCR in basis points (10000 = 100%).
+    function setLCRFloor(uint256 _lcrFloorBps) external onlyOperator {
+        lcrFloorBps = _lcrFloorBps;
+        emit LCRFloorUpdated(_lcrFloorBps);
+    }
+
+    // ─── CRE Integration: onReport ──────────────────────────────────────
+
+    /// @notice Called by Chainlink KeystoneForwarder after DON consensus verification.
+    /// @dev The Forwarder has already verified that the DON reached consensus on this report.
+    ///      We only need to verify msg.sender == chainlinkForwarder.
+    /// @param metadata Workflow identification (workflow name, owner, report name).
+    /// @param report ABI-encoded payload: (uint8 action, bytes actionData).
+    function onReport(bytes calldata metadata, bytes calldata report) external override {
+        // metadata is unused but required by IReceiver interface
+        (metadata);
+
+        if (msg.sender != chainlinkForwarder) revert OnlyForwarder();
+
+        (uint8 action, bytes memory actionData) = abi.decode(report, (uint8, bytes));
+
+        if (action == ACTION_UPDATE_RISK_PARAMS) {
+            _handleUpdateRiskParams(actionData);
+        } else if (action == ACTION_DEFENSIVE_REBALANCE) {
+            _handleDefensiveRebalance(actionData);
+        } else if (action == ACTION_EMERGENCY_PAUSE) {
+            _handleEmergencyPause(actionData);
+        } else if (action == ACTION_SETTLE_EPOCH) {
+            _handleSettleEpoch(actionData);
+        } else if (action == ACTION_HARVEST_YIELD) {
+            _handleHarvestYield(actionData);
+        } else {
+            revert InvalidAction(action);
+        }
+    }
+
+    // ─── CRE Internal Action Handlers ───────────────────────────────────
+
+    /// @dev Decodes and applies new risk parameters from CRE risk model.
+    /// @param actionData Encoding: (address[] sources, SourceRiskParams[] params, RiskSnapshot snapshot).
+    function _handleUpdateRiskParams(bytes memory actionData) internal {
+        (address[] memory sources, RiskModel.SourceRiskParams[] memory params, RiskModel.RiskSnapshot memory snapshot) =
+            abi.decode(actionData, (address[], RiskModel.SourceRiskParams[], RiskModel.RiskSnapshot));
+
+        if (sources.length != params.length) revert ArrayLengthMismatch();
+
+        for (uint256 i = 0; i < sources.length; i++) {
+            // Validate source is registered
+            if (!isRegisteredSource[sources[i]]) revert UnknownSource(sources[i]);
+
+            // Apply bounds checking on params (prevent CRE from setting absurd values)
+            if (params[i].liquidityHaircutBps > RiskModel.MAX_HAIRCUT_BPS) revert HaircutTooHigh();
+            if (params[i].maxConcentrationBps > uint16(RiskModel.BPS)) revert InvalidConcentration();
+
+            params[i].lastUpdated = uint64(block.timestamp);
+            sourceRiskParams[sources[i]] = params[i];
+            emit RiskParamsUpdated(sources[i], params[i]);
+        }
+
+        latestRiskSnapshot = snapshot;
+        emit RiskSnapshotUpdated(snapshot);
+    }
+
+    /// @dev Pulls capital from a source back to idle (vault holds underlying asset).
+    /// @param actionData Encoding: (address source, uint256 amount).
+    function _handleDefensiveRebalance(bytes memory actionData) internal {
+        (address source, uint256 amount) = abi.decode(actionData, (address, uint256));
+        if (!isRegisteredSource[source]) revert UnknownSource(source);
+
+        // Find source index and withdraw
+        uint256 len = yieldSources.length;
+        for (uint256 i; i < len; ++i) {
+            if (address(yieldSources[i]) == source) {
+                yieldSources[i].withdraw(amount);
+                emit DefensiveRebalanceTriggered(source, amount);
+                return;
+            }
+        }
+    }
+
+    /// @dev Emergency pause — stops deposits and optionally begins unwinding.
+    /// @param actionData Encoding: (uint8 severity).
+    ///        severity 0 = pause deposits only, 1 = pause + begin unwind.
+    function _handleEmergencyPause(bytes memory actionData) internal {
+        (uint8 severity) = abi.decode(actionData, (uint8));
+        _pause();
+        emit EmergencyPauseTriggered(severity);
+        emit VaultPaused(address(this));
+        // NOTE: Unwind logic would go here for severity > 0
+    }
+
+    /// @dev Settles current epoch (same logic as existing settleEpoch).
+    /// @param actionData Unused, reserved for future parameters.
+    function _handleSettleEpoch(bytes memory actionData) internal {
+        // actionData is unused for now but reserved for future parameters
+        (actionData);
+        _settleCurrentEpoch();
+    }
+
+    /// @dev Harvests yield from specified sources.
+    /// @param actionData Encoding: (address[] sources).
+    function _handleHarvestYield(bytes memory actionData) internal {
+        (address[] memory sources) = abi.decode(actionData, (address[]));
+        for (uint256 i = 0; i < sources.length; i++) {
+            _harvestFromSource(sources[i]);
+        }
+    }
+
+    /// @dev Internal settlement logic, callable by both settleEpoch() and _handleSettleEpoch().
+    function _settleCurrentEpoch() internal {
+        uint256 epochId = currentEpochId;
+        Epoch storage epoch = epochs[epochId];
+
+        if (epoch.status == EpochStatus.SETTLED) revert EpochAlreadySettled();
+        if (block.timestamp - epochOpenedAt < MIN_EPOCH_DURATION) revert EpochTooYoung();
+
+        _accrueManagementFee();
+        _updateEma();
+        _checkDrawdown();
+
+        uint256 burnedShares = epoch.totalSharesBurned;
+
+        // Use EMA instead of spot totalAssets for manipulation resistance.
+        uint256 currentTotalAssets = emaTotalAssets;
+        uint256 effectiveSupply = totalSupply() + totalPendingShares;
+        uint256 assetsOwed =
+            (effectiveSupply > 0) ? burnedShares.mulDiv(currentTotalAssets, effectiveSupply, Math.Rounding.Floor) : 0;
+
+        // Pull from yield sources if idle funds are insufficient (waterfall)
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        uint256 available = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
+
+        if (assetsOwed > available) {
+            uint256 remaining = assetsOwed - available;
+            uint256 len = yieldSources.length;
+
+            for (uint256 i; i < len && remaining > 0; ++i) {
+                uint256 srcBal = yieldSources[i].balance();
+                if (srcBal == 0) continue;
+
+                uint256 pull = remaining > srcBal ? srcBal : remaining;
+                yieldSources[i].withdraw(pull);
+                remaining -= pull;
+
+                emit WithdrawnFromYield(i, pull);
+            }
+
+            if (remaining > 0) revert InsufficientLiquidity();
+        }
+
+        epoch.totalAssetsOwed = assetsOwed;
+        epoch.status = EpochStatus.SETTLED;
+        totalPendingShares -= burnedShares;
+        totalClaimableAssets += assetsOwed;
+
+        currentEpochId = epochId + 1;
+        epochOpenedAt = block.timestamp;
+
+        emit EpochSettled(epochId, assetsOwed);
+    }
+
+    /// @dev Internal harvest logic for a single source by address.
+    function _harvestFromSource(address source) internal {
+        uint256 len = yieldSources.length;
+        for (uint256 i; i < len; ++i) {
+            if (address(yieldSources[i]) != source) continue;
+
+            uint256 currentBalance = yieldSources[i].balance();
+            uint256 hwm = lastHarvestedBalance[i];
+
+            if (currentBalance > hwm) {
+                uint256 profit = currentBalance - hwm;
+                lastHarvestedBalance[i] = currentBalance;
+
+                if (profit > 0 && performanceFeeBps > 0 && feeRecipient != address(0)) {
+                    uint256 feeAssets = profit.mulDiv(performanceFeeBps, 10_000, Math.Rounding.Floor);
+                    uint256 feeShares = _convertToSharesAtEma(feeAssets);
+
+                    if (feeShares > 0) {
+                        _mint(feeRecipient, feeShares);
+                        emit YieldHarvested(profit, feeShares);
+                    }
+                }
+            }
+            return;
+        }
     }
 
     function _onlyOperator() internal view {
