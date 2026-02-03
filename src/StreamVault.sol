@@ -7,6 +7,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IYieldSource} from "./IYieldSource.sol";
 
 /// @title StreamVault
@@ -14,7 +15,7 @@ import {IYieldSource} from "./IYieldSource.sol";
 ///         EMA-smoothed NAV for manipulation-resistant settlement, and continuous management fee accrual.
 ///         Deposits are instant. Withdrawals go through a three-step process:
 ///         requestWithdraw → settleEpoch → claimWithdrawal.
-contract StreamVault is ERC4626, ReentrancyGuard {
+contract StreamVault is ERC4626, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
     using Math for uint256;
 
@@ -28,6 +29,8 @@ contract StreamVault is ERC4626, ReentrancyGuard {
     uint256 public constant EMA_FLOOR_BPS = 9_500; // EMA >= 95% of spot
     uint256 public constant SECONDS_PER_YEAR = 365.25 days; // 31_557_600
     uint256 public constant MIN_EPOCH_DURATION = 300; // 5 minutes — prevents settlement timing attacks
+    uint256 public constant MAX_DRAWDOWN_BPS = 5_000; // Max configurable drawdown: 50%
+    uint256 public constant DEFAULT_MAX_DRAWDOWN_BPS = 1_000; // Default: 10% drawdown triggers pause
 
     // ─── Types ──────────────────────────────────────────────────────────
 
@@ -72,6 +75,11 @@ contract StreamVault is ERC4626, ReentrancyGuard {
     uint256 public smoothingPeriod; // seconds for full convergence
     uint256 public epochOpenedAt; // timestamp when current epoch started
 
+    // ─── Drawdown Protection State ───────────────────────────────────────
+
+    uint256 public navHighWaterMark; // highest NAV per share (18 decimals)
+    uint256 public maxDrawdownBps; // max allowed drawdown before auto-pause (e.g., 1000 = 10%)
+
     // ─── Mappings ───────────────────────────────────────────────────────
 
     mapping(uint256 => Epoch) public epochs;
@@ -93,6 +101,11 @@ contract StreamVault is ERC4626, ReentrancyGuard {
     event FeeRecipientUpdated(address indexed newFeeRecipient);
     event ManagementFeeUpdated(uint256 newFeeBps);
     event SmoothingPeriodUpdated(uint256 newPeriod);
+    event VaultPaused(address indexed by);
+    event VaultUnpaused(address indexed by);
+    event DrawdownCircuitBreaker(uint256 currentNav, uint256 highWaterMark, uint256 drawdownBps);
+    event NavHighWaterMarkUpdated(uint256 newHighWaterMark);
+    event MaxDrawdownUpdated(uint256 newMaxDrawdownBps);
 
     // ─── Errors ─────────────────────────────────────────────────────────
 
@@ -111,6 +124,7 @@ contract StreamVault is ERC4626, ReentrancyGuard {
     error FeeTooHigh();
     error InvalidSmoothingPeriod();
     error EpochTooYoung();
+    error InvalidDrawdownThreshold();
 
     // ─── Modifiers ──────────────────────────────────────────────────────
 
@@ -148,6 +162,10 @@ contract StreamVault is ERC4626, ReentrancyGuard {
         emaTotalAssets = 10 ** _decimalsOffset(); // match virtual offset
         lastEmaUpdateTimestamp = block.timestamp;
         epochOpenedAt = block.timestamp;
+
+        // Initialize drawdown protection with default 10% threshold
+        maxDrawdownBps = DEFAULT_MAX_DRAWDOWN_BPS;
+        navHighWaterMark = 1e18; // 1.0 in 18-decimal precision
     }
 
     // ─── ERC-4626 Overrides ─────────────────────────────────────────────
@@ -178,7 +196,8 @@ contract StreamVault is ERC4626, ReentrancyGuard {
     }
 
     /// @notice Override to accrue management fee, update EMA, and snap EMA on first deposit.
-    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override nonReentrant {
+    /// @dev Pausing blocks deposits to protect users if a yield source is compromised.
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override nonReentrant whenNotPaused {
         _accrueManagementFee();
         _updateEma();
 
@@ -263,7 +282,8 @@ contract StreamVault is ERC4626, ReentrancyGuard {
     // ─── Async Withdrawal: Step 1 — Request ────────────────────────────
 
     /// @notice Burn shares and queue a withdrawal request in the current epoch.
-    function requestWithdraw(uint256 shares) external nonReentrant {
+    /// @dev Pausing blocks new withdrawal requests but allows claiming from settled epochs.
+    function requestWithdraw(uint256 shares) external nonReentrant whenNotPaused {
         if (shares == 0) revert ZeroShares();
 
         _accrueManagementFee();
@@ -292,6 +312,7 @@ contract StreamVault is ERC4626, ReentrancyGuard {
 
         _accrueManagementFee();
         _updateEma();
+        _checkDrawdown();
 
         uint256 burnedShares = epoch.totalSharesBurned;
 
@@ -395,6 +416,7 @@ contract StreamVault is ERC4626, ReentrancyGuard {
     function harvestYield() external onlyOperator nonReentrant {
         _accrueManagementFee();
         _updateEma();
+        _checkDrawdown();
 
         uint256 totalProfit;
         uint256 len = yieldSources.length;
@@ -509,6 +531,41 @@ contract StreamVault is ERC4626, ReentrancyGuard {
         emit EmaUpdated(emaTotalAssets, spot);
     }
 
+    /// @notice Calculate the current NAV per share in 18-decimal precision.
+    /// @dev Uses EMA-based NAV for manipulation resistance.
+    function navPerShare() public view returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0) return 1e18;
+        // Use EMA for consistent pricing with settlement
+        return (emaTotalAssets * 1e18) / supply;
+    }
+
+    /// @notice Check for excessive drawdown and auto-pause if threshold exceeded.
+    /// @dev Updates high water mark if NAV is at new high.
+    ///      Triggers circuit breaker if drawdown exceeds maxDrawdownBps.
+    function _checkDrawdown() internal {
+        if (maxDrawdownBps == 0) return; // Drawdown protection disabled
+
+        uint256 currentNav = navPerShare();
+
+        // Update high water mark if at new high
+        if (currentNav > navHighWaterMark) {
+            navHighWaterMark = currentNav;
+            emit NavHighWaterMarkUpdated(currentNav);
+            return;
+        }
+
+        // Calculate drawdown from high water mark
+        uint256 drawdownBps = ((navHighWaterMark - currentNav) * 10_000) / navHighWaterMark;
+
+        // Trigger circuit breaker if drawdown exceeds threshold
+        if (drawdownBps >= maxDrawdownBps && !paused()) {
+            _pause();
+            emit DrawdownCircuitBreaker(currentNav, navHighWaterMark, drawdownBps);
+            emit VaultPaused(address(this));
+        }
+    }
+
     // ─── Batch Operations ─────────────────────────────────────────────
 
     /// @notice Claim withdrawals from multiple settled epochs in a single transaction.
@@ -618,6 +675,37 @@ contract StreamVault is ERC4626, ReentrancyGuard {
         }
         smoothingPeriod = _smoothingPeriod;
         emit SmoothingPeriodUpdated(_smoothingPeriod);
+    }
+
+    /// @notice Pause deposits and new withdrawal requests.
+    /// @dev Use in emergencies (e.g., yield source exploit, oracle failure).
+    ///      Claims from settled epochs remain available — users can always exit.
+    function pause() external onlyOperator {
+        _pause();
+        emit VaultPaused(msg.sender);
+    }
+
+    /// @notice Resume normal operations after pause.
+    function unpause() external onlyOperator {
+        _unpause();
+        emit VaultUnpaused(msg.sender);
+    }
+
+    /// @notice Update the max drawdown threshold.
+    /// @param _maxDrawdownBps New threshold in basis points (e.g., 1000 = 10%). Set to 0 to disable.
+    function setMaxDrawdown(uint256 _maxDrawdownBps) external onlyOperator {
+        if (_maxDrawdownBps > MAX_DRAWDOWN_BPS) revert InvalidDrawdownThreshold();
+        maxDrawdownBps = _maxDrawdownBps;
+        emit MaxDrawdownUpdated(_maxDrawdownBps);
+    }
+
+    /// @notice Reset the NAV high water mark to current NAV.
+    /// @dev Use after recovering from a drawdown event and resuming operations.
+    ///      This prevents the vault from immediately re-triggering the circuit breaker.
+    function resetNavHighWaterMark() external onlyOperator {
+        uint256 currentNav = navPerShare();
+        navHighWaterMark = currentNav;
+        emit NavHighWaterMarkUpdated(currentNav);
     }
 
     function _onlyOperator() internal view {

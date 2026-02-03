@@ -54,6 +54,10 @@ abstract contract StreamVaultTestBase is Test {
         // Register yield source
         vm.prank(operator);
         vault.addYieldSource(IYieldSource(address(yieldSource)));
+
+        // Disable drawdown protection for existing tests (backward compatibility)
+        vm.prank(operator);
+        vault.setMaxDrawdown(0);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

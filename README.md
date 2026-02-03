@@ -242,17 +242,37 @@ graph LR
 
 | Contract | Description |
 | --- | --- |
-| `StreamVault.sol` | Core vault — ERC-4626 with epoch queue, EMA, and fee accrual |
+| `StreamVault.sol` | Core vault — ERC-4626 with epoch queue, EMA, fee accrual, and drawdown protection |
 | `IYieldSource.sol` | Interface for yield connectors: `deposit`, `withdraw`, `balance`, `asset` |
 | `AaveV3YieldSource.sol` | Adapter wrapping Aave V3 Pool (supply/withdraw + aToken tracking) |
 | `MorphoYieldSource.sol` | Adapter wrapping MetaMorpho ERC-4626 vaults |
 | `MockYieldSource.sol` | Test yield source with configurable rate and mintable backing |
+| `IPriceOracle.sol` | Interface for price oracles (price validation, staleness checks) |
+| `ChainlinkOracle.sol` | Chainlink price feed adapter with decimal normalization and staleness validation |
 
 ---
 
 ## Usage
 
 ### Deploying the Vault
+
+**Option 1: Using Forge Script (recommended)**
+
+```shell
+# Set environment variables
+export PRIVATE_KEY=<deployer-key>
+export ASSET_ADDRESS=<usdc-address>
+export OPERATOR_ADDRESS=<operator-address>
+
+# Optional: Aave adapter
+export AAVE_POOL=<aave-pool-address>
+export AAVE_ATOKEN=<aave-atoken-address>
+
+# Deploy
+forge script script/Deploy.s.sol:DeployStreamVault --rpc-url <RPC_URL> --broadcast --verify
+```
+
+**Option 2: Programmatic Deployment**
 
 ```solidity
 StreamVault vault = new StreamVault(
@@ -363,6 +383,8 @@ vault.setFeeRecipient(newRecipient);        // change fee recipient
 vault.setManagementFee(100);                // change to 1% annual (accrues at old rate first)
 vault.setSmoothingPeriod(7200);             // change EMA window to 2 hours
 vault.removeYieldSource(sourceIndex);       // remove source (must have 0 balance)
+vault.pause();                              // emergency pause deposits & new requests
+vault.unpause();                            // resume normal operations
 ```
 
 ### Epoch State Machine
@@ -411,6 +433,77 @@ assetsOwed = burnedShares * emaTotalAssets / (totalSupply + totalPendingShares)
 - **`onlyVault` guards** on all yield source adapters
 - **Disabled sync withdrawals**: `withdraw()`, `redeem()`, `maxWithdraw()`, `maxRedeem()`, `previewWithdraw()`, `previewRedeem()` all return 0 or revert
 - **Batch claim reentrancy guard**: `batchClaimWithdrawals()` is protected by `nonReentrant`, preventing callback attacks from malicious ERC-20 tokens during multi-epoch claims
+- **Emergency pause mechanism**: Operator can pause deposits and new withdrawal requests if a yield source is compromised; claims from settled epochs always remain available so users can exit
+- **Max drawdown circuit breaker**: Auto-pause triggers when NAV per share drops below configurable threshold (default 10%) from high water mark — prevents continued deposits into a compromised vault
+
+### Drawdown Protection
+
+The vault includes an automatic circuit breaker that monitors NAV per share and pauses if excessive drawdown is detected:
+
+```solidity
+// Default: 10% drawdown triggers auto-pause
+// NAV high water mark tracked across all interactions
+// Configure threshold (or disable with 0)
+vault.setMaxDrawdown(1500);  // 15% threshold
+vault.setMaxDrawdown(0);     // disable
+
+// Reset high water mark after recovery
+vault.resetNavHighWaterMark();
+```
+
+**How it works:**
+1. Every interaction (deposit, settle, harvest) updates the NAV high water mark if NAV is at a new high
+2. If NAV falls below `(100% - maxDrawdownBps)` of the high water mark, the vault auto-pauses
+3. `DrawdownCircuitBreaker` event emitted with current NAV, HWM, and drawdown percentage
+4. Operator can unpause and reset HWM after investigating and resolving the issue
+
+### Chainlink Oracle Integration
+
+For off-chain price validation and monitoring, the `ChainlinkOracle` adapter provides:
+
+```solidity
+ChainlinkOracle oracle = new ChainlinkOracle(
+    chainlinkFeed,           // e.g., USDC/USD price feed
+    underlyingAsset,         // asset address
+    3600                     // staleness threshold (1 hour)
+);
+
+// Get price normalized to 18 decimals
+(uint256 price, uint256 updatedAt) = oracle.getPrice();
+
+// Check if price is stale
+bool isStale = oracle.isStale();
+```
+
+Features:
+- Automatic decimal normalization (any feed decimals → 18 decimals)
+- Round completeness validation (prevents using incomplete rounds)
+- Configurable staleness threshold
+- Reverts on negative/zero prices
+
+### Emergency Pause
+
+The vault includes an emergency pause mechanism for situations where immediate action is required:
+
+```solidity
+// Operator pauses the vault (e.g., yield source exploit detected)
+vault.pause();
+
+// Users can still claim from settled epochs — exit path always open
+vault.claimWithdrawal(epochId);
+
+// When situation is resolved
+vault.unpause();
+```
+
+**What's blocked when paused:**
+- `deposit()` / `mint()` — no new capital enters
+- `requestWithdraw()` — no new withdrawal requests
+
+**What's allowed when paused:**
+- `claimWithdrawal()` / `batchClaimWithdrawals()` — users can always exit from settled epochs
+- `settleEpoch()` — operator can still process pending withdrawal requests
+- All view functions
 
 ---
 
@@ -459,7 +552,7 @@ Slither runs against the production contracts (`src/`) with test and library fil
 
 ### Test Suite
 
-129 tests across 14 test contracts in 2 test files, all inheriting from a shared `StreamVaultTestBase` harness that wires up a MockERC20, StreamVault, and MockYieldSource with standard parameters.
+169 tests across 17 test contracts in 3 test files, with a shared `StreamVaultTestBase` harness that wires up a MockERC20, StreamVault, and MockYieldSource with standard parameters.
 
 | Test Contract | Tests | What It Covers |
 | --- | --- | --- |
@@ -476,7 +569,10 @@ Slither runs against the production contracts (`src/`) with test and library fil
 | `StatefulInvariant_Test` | 6 | **True Foundry invariant tests** with a `VaultHandler` that randomly sequences deposit, requestWithdraw, settleEpoch, claimWithdrawal, deployToYield, withdrawFromYield, harvestYield, and warpTime across 5 actors over 128k calls per invariant. Checks: totalAssets accounting identity, EMA floor, fee share bounds, claimable <= gross, epoch claimed <= owed, pending shares consistency |
 | `Reentrancy_Test` | 2 | Malicious `ReentrantERC20` attempts reentrancy during `claimWithdrawal` (transfer callback) and `deposit` (transferFrom callback) — both blocked by `ReentrancyGuard` |
 | `ERC4626Compliance_Test` | 21 | Full ERC-4626 spec compliance: `asset()`, `totalAssets()`, `convertToShares/Assets`, `maxDeposit/Mint/Withdraw/Redeem`, `previewDeposit/Mint`, deposit to different receiver, mint exact preview, roundtrip share-to-asset preservation, fuzzed preview==actual, fuzzed monotonicity |
-| `ViewAndBatch_Test` | 8 | `getUserWithdrawRequest`, `getEpochInfo`, `getAllYieldSourceBalances`, `getAllYieldSources`, `idleBalance` (including claimable exclusion), `batchClaimWithdrawals` across multiple epochs, revert on unsettled/no-request |
+| `ViewAndBatch_Test` | 9 | `getUserWithdrawRequest`, `getEpochInfo`, `getAllYieldSourceBalances`, `getAllYieldSources`, `idleBalance` (including claimable exclusion), `batchClaimWithdrawals` across multiple epochs, revert on unsettled/no-request |
+| `Pause_Test` | 11 | Emergency pause/unpause access control, deposit/mint/requestWithdraw blocked when paused, claims allowed when paused, operator can still settle when paused, unpause resumes operations, event emissions |
+| `Drawdown_Test` | 13 | Max drawdown configuration, auto-pause on excessive loss, HWM updates with yield, reset HWM after recovery, disabled when threshold is 0, NAV per share calculation, circuit breaker event emission |
+| `ChainlinkOracle_Test` | 16 | Price normalization (6/8/18 decimals → 18), staleness detection, incomplete round rejection, negative/zero price rejection, boundary conditions, fuzz tests for price normalization and staleness |
 
 ### Test Design Patterns
 

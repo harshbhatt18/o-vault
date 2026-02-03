@@ -78,4 +78,24 @@ contract MockYieldSource is IYieldSource {
     function _onlyVault() internal view {
         if (msg.sender != VAULT) revert OnlyVault();
     }
+
+    // ─── Test Helpers (for simulating yield/loss scenarios) ─────────────
+
+    /// @notice Simulate yield by minting and adding to principal.
+    /// @dev Only for testing — allows external yield injection.
+    function simulateYield(uint256 amount) external {
+        _accrue();
+        IMintable(address(UNDERLYING_ASSET)).mint(address(this), amount);
+        principal += amount;
+    }
+
+    /// @notice Simulate loss by burning from principal.
+    /// @dev Only for testing — transfers tokens out to simulate loss.
+    function simulateLoss(uint256 amount) external {
+        _accrue();
+        if (amount > principal) amount = principal;
+        principal -= amount;
+        // Burn by sending to zero address (or just reduce principal)
+        UNDERLYING_ASSET.safeTransfer(address(0xdead), amount);
+    }
 }
