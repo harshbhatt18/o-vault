@@ -449,25 +449,25 @@ contract StreamVault_ERC4626Compliance_Test is Test {
 
     /// @dev withdraw MUST revert (async vault)
     function test_erc4626_withdraw_reverts() public {
-        vm.expectRevert("Use requestWithdraw");
+        vm.expectRevert(StreamVault.SyncWithdrawDisabled.selector);
         vault.withdraw(100, alice, alice);
     }
 
     /// @dev redeem MUST revert (async vault)
     function test_erc4626_redeem_reverts() public {
-        vm.expectRevert("Use requestWithdraw");
+        vm.expectRevert(StreamVault.SyncWithdrawDisabled.selector);
         vault.redeem(100, alice, alice);
     }
 
     /// @dev previewWithdraw MUST revert (async vault)
     function test_erc4626_previewWithdraw_reverts() public {
-        vm.expectRevert("Use requestWithdraw");
+        vm.expectRevert(StreamVault.SyncWithdrawDisabled.selector);
         vault.previewWithdraw(100);
     }
 
     /// @dev previewRedeem MUST revert (async vault)
     function test_erc4626_previewRedeem_reverts() public {
-        vm.expectRevert("Use requestWithdraw");
+        vm.expectRevert(StreamVault.SyncWithdrawDisabled.selector);
         vault.previewRedeem(100);
     }
 
@@ -778,7 +778,7 @@ contract StreamVault_Pause_Test is Test {
         usdc.mint(alice, 1000e6);
         vm.startPrank(alice);
         usdc.approve(address(vault), 1000e6);
-        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        vm.expectRevert(); // ERC4626ExceededMaxDeposit (maxDeposit returns 0 when paused)
         vault.deposit(1000e6, alice);
         vm.stopPrank();
     }
@@ -790,9 +790,23 @@ contract StreamVault_Pause_Test is Test {
         usdc.mint(alice, 1000e6);
         vm.startPrank(alice);
         usdc.approve(address(vault), 1000e6);
-        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        vm.expectRevert(); // ERC4626ExceededMaxMint (maxMint returns 0 when paused)
         vault.mint(1000e6, alice);
         vm.stopPrank();
+    }
+
+    function test_pause_maxDepositReturnsZero() public {
+        assertGt(vault.maxDeposit(alice), 0);
+        vm.prank(operator);
+        vault.pause();
+        assertEq(vault.maxDeposit(alice), 0);
+    }
+
+    function test_pause_maxMintReturnsZero() public {
+        assertGt(vault.maxMint(alice), 0);
+        vm.prank(operator);
+        vault.pause();
+        assertEq(vault.maxMint(alice), 0);
     }
 
     function test_pause_blocksRequestWithdraw() public {

@@ -55,7 +55,8 @@ contract ChainlinkOracle is IPriceOracle {
         if (block.timestamp - _updatedAt > STALENESS_THRESHOLD) revert StalePrice();
 
         // Normalize to 18 decimals
-        // Safe cast: we validated answer > 0 above, so uint256 conversion is safe
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // casting to 'uint256' is safe because we validated answer > 0 above
         price = _normalize(uint256(answer));
         updatedAt = _updatedAt;
     }

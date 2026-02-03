@@ -18,6 +18,7 @@ contract MorphoYieldSource is IYieldSource {
     address public immutable VAULT;
 
     error OnlyVault();
+    error ZeroAddress();
 
     modifier onlyVault() {
         _onlyVault();
@@ -27,6 +28,7 @@ contract MorphoYieldSource is IYieldSource {
     /// @param _morphoVault The MetaMorpho ERC-4626 vault address.
     /// @param _vault The StreamVault that owns this adapter.
     constructor(address _morphoVault, address _vault) {
+        if (_morphoVault == address(0) || _vault == address(0)) revert ZeroAddress();
         MORPHO_VAULT = IERC4626(_morphoVault);
         UNDERLYING_ASSET = IERC20(IERC4626(_morphoVault).asset());
         VAULT = _vault;

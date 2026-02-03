@@ -75,7 +75,11 @@ library RiskModel {
     /// @return valid True if all parameters are valid
     function validateParams(SourceRiskParams memory params) internal pure returns (bool valid) {
         if (params.liquidityHaircutBps > MAX_HAIRCUT_BPS) return false;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // casting to 'uint16' is safe because BPS = 10_000 fits in uint16 (max 65535)
         if (params.stressOutflowBps > uint16(BPS)) return false;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // casting to 'uint16' is safe because BPS = 10_000 fits in uint16 (max 65535)
         if (params.maxConcentrationBps > uint16(BPS)) return false;
         if (params.riskTier > TIER_RED) return false;
         return true;

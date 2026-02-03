@@ -94,7 +94,7 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
         assertEq(vault.asset(), address(usdc));
         assertEq(vault.operator(), operator);
         assertEq(vault.feeRecipient(), feeRecipient);
-        assertEq(vault.performanceFeeBps(), PERF_FEE_BPS);
+        assertEq(vault.PERFORMANCE_FEE_BPS(), PERF_FEE_BPS);
         assertEq(vault.managementFeeBps(), MGMT_FEE_BPS);
         assertEq(vault.smoothingPeriod(), SMOOTHING);
         assertEq(vault.currentEpochId(), 0);
@@ -134,7 +134,7 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
     function test_boundaryValues_perfFeeMax() public {
         StreamVault v =
             new StreamVault(IERC20(address(usdc)), operator, feeRecipient, 5_000, MGMT_FEE_BPS, SMOOTHING, "V", "V");
-        assertEq(v.performanceFeeBps(), 5_000);
+        assertEq(v.PERFORMANCE_FEE_BPS(), 5_000);
     }
 
     function test_boundaryValues_smoothingBounds() public {
@@ -381,12 +381,12 @@ contract StreamVault_Withdrawal_Test is StreamVaultTestBase {
     }
 
     function test_syncWithdraw_reverts() public {
-        vm.expectRevert("Use requestWithdraw");
+        vm.expectRevert(StreamVault.SyncWithdrawDisabled.selector);
         vault.withdraw(100, alice, alice);
     }
 
     function test_syncRedeem_reverts() public {
-        vm.expectRevert("Use requestWithdraw");
+        vm.expectRevert(StreamVault.SyncWithdrawDisabled.selector);
         vault.redeem(100, alice, alice);
     }
 
@@ -399,12 +399,12 @@ contract StreamVault_Withdrawal_Test is StreamVaultTestBase {
     }
 
     function test_previewWithdraw_reverts() public {
-        vm.expectRevert("Use requestWithdraw");
+        vm.expectRevert(StreamVault.SyncWithdrawDisabled.selector);
         vault.previewWithdraw(100);
     }
 
     function test_previewRedeem_reverts() public {
-        vm.expectRevert("Use requestWithdraw");
+        vm.expectRevert(StreamVault.SyncWithdrawDisabled.selector);
         vault.previewRedeem(100);
     }
 }
@@ -863,22 +863,37 @@ contract StreamVault_ManagementFee_Test is StreamVaultTestBase {
 // ─────────────────────────────────────────────────────────────────────────────
 
 contract StreamVault_Admin_Test is StreamVaultTestBase {
-    function test_setOperator_success() public {
+    function test_transferOperator_success() public {
         vm.prank(operator);
-        vault.setOperator(alice);
+        vault.transferOperator(alice);
+        assertEq(vault.pendingOperator(), alice);
+        assertEq(vault.operator(), operator); // not changed yet
+
+        vm.prank(alice);
+        vault.acceptOperator();
         assertEq(vault.operator(), alice);
+        assertEq(vault.pendingOperator(), address(0));
     }
 
-    function test_setOperator_zeroAddressReverts() public {
+    function test_transferOperator_zeroAddressReverts() public {
         vm.prank(operator);
         vm.expectRevert(StreamVault.ZeroAddress.selector);
-        vault.setOperator(address(0));
+        vault.transferOperator(address(0));
     }
 
-    function test_setOperator_onlyOperator() public {
+    function test_transferOperator_onlyOperator() public {
         vm.prank(alice);
         vm.expectRevert(StreamVault.OnlyOperator.selector);
-        vault.setOperator(alice);
+        vault.transferOperator(alice);
+    }
+
+    function test_acceptOperator_onlyPendingOperator() public {
+        vm.prank(operator);
+        vault.transferOperator(alice);
+
+        vm.prank(bob);
+        vm.expectRevert(StreamVault.OnlyPendingOperator.selector);
+        vault.acceptOperator();
     }
 
     function test_setFeeRecipient_success() public {

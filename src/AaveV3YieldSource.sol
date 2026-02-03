@@ -44,6 +44,7 @@ contract AaveV3YieldSource is IYieldSource {
     address public immutable VAULT;
 
     error OnlyVault();
+    error ZeroAddress();
 
     modifier onlyVault() {
         _onlyVault();
@@ -55,6 +56,9 @@ contract AaveV3YieldSource is IYieldSource {
     /// @param _aToken The corresponding aToken (e.g. aUSDC).
     /// @param _vault The StreamVault that owns this adapter.
     constructor(address _asset, address _pool, address _aToken, address _vault) {
+        if (_asset == address(0) || _pool == address(0) || _aToken == address(0) || _vault == address(0)) {
+            revert ZeroAddress();
+        }
         UNDERLYING_ASSET = IERC20(_asset);
         POOL = IPool(_pool);
         A_TOKEN = IERC20(_aToken);

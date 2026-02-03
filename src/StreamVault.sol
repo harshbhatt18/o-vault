@@ -57,8 +57,9 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
 
     IYieldSource[] public yieldSources;
     address public operator;
+    address public pendingOperator; // 2-step operator transfer
     address public feeRecipient;
-    uint256 public immutable performanceFeeBps; // e.g. 1000 = 10%
+    uint256 public immutable PERFORMANCE_FEE_BPS; // e.g. 1000 = 10%
 
     uint256 public currentEpochId;
     uint256 public totalPendingShares; // shares burned but not yet settled
@@ -115,6 +116,7 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
     event YieldSourceRemoved(uint256 indexed sourceIndex, address indexed source);
     event ManagementFeeAccrued(uint256 feeAssets, uint256 feeShares, uint256 elapsed);
     event EmaUpdated(uint256 newEma, uint256 spot);
+    event OperatorTransferRequested(address indexed currentOperator, address indexed pendingOperator);
     event OperatorUpdated(address indexed newOperator);
     event FeeRecipientUpdated(address indexed newFeeRecipient);
     event ManagementFeeUpdated(uint256 newFeeBps);
@@ -157,6 +159,9 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
     error InvalidConcentration();
     error LCRBreached(uint256 actual, uint256 floor);
     error ConcentrationBreached(address source);
+    error SyncWithdrawDisabled();
+    error OnlyPendingOperator();
+    error NoPendingOperator();
 
     // ─── Modifiers ──────────────────────────────────────────────────────
 
@@ -167,7 +172,7 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
 
     /// @notice Allows either the trusted operator or the CRE Forwarder
     modifier onlyOperatorOrCRE() {
-        if (msg.sender != operator && msg.sender != chainlinkForwarder) revert OnlyOperator();
+        _onlyOperatorOrCRE();
         _;
     }
 
@@ -192,7 +197,7 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
 
         operator = _operator;
         feeRecipient = _feeRecipient;
-        performanceFeeBps = _performanceFeeBps;
+        PERFORMANCE_FEE_BPS = _performanceFeeBps;
         managementFeeBps = _managementFeeBps;
         lastFeeAccrualTimestamp = block.timestamp;
 
@@ -263,12 +268,24 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
 
     /// @notice Disable standard ERC-4626 withdraw — all exits go through the epoch queue.
     function withdraw(uint256, address, address) public pure override returns (uint256) {
-        revert("Use requestWithdraw");
+        revert SyncWithdrawDisabled();
     }
 
     /// @notice Disable standard ERC-4626 redeem — all exits go through the epoch queue.
     function redeem(uint256, address, address) public pure override returns (uint256) {
-        revert("Use requestWithdraw");
+        revert SyncWithdrawDisabled();
+    }
+
+    /// @notice Returns 0 when paused — deposits are disabled during emergencies.
+    /// @dev ERC-4626 spec: "MUST return 0 if the Vault is paused or otherwise incapacitated."
+    function maxDeposit(address) public view override returns (uint256) {
+        return paused() ? 0 : type(uint256).max;
+    }
+
+    /// @notice Returns 0 when paused — minting is disabled during emergencies.
+    /// @dev ERC-4626 spec: "MUST return 0 if the Vault is paused or otherwise incapacitated."
+    function maxMint(address) public view override returns (uint256) {
+        return paused() ? 0 : type(uint256).max;
     }
 
     /// @notice Always returns 0 — sync withdrawals are disabled.
@@ -283,12 +300,12 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
 
     /// @notice Always reverts — sync withdrawals are disabled.
     function previewWithdraw(uint256) public pure override returns (uint256) {
-        revert("Use requestWithdraw");
+        revert SyncWithdrawDisabled();
     }
 
     /// @notice Always reverts — sync redeems are disabled.
     function previewRedeem(uint256) public pure override returns (uint256) {
-        revert("Use requestWithdraw");
+        revert SyncWithdrawDisabled();
     }
 
     // ─── Yield Source Management ────────────────────────────────────────
@@ -456,9 +473,9 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
             }
         }
 
-        if (totalProfit == 0 || performanceFeeBps == 0 || feeRecipient == address(0)) return;
+        if (totalProfit == 0 || PERFORMANCE_FEE_BPS == 0 || feeRecipient == address(0)) return;
 
-        uint256 feeAssets = totalProfit.mulDiv(performanceFeeBps, 10_000, Math.Rounding.Floor);
+        uint256 feeAssets = totalProfit.mulDiv(PERFORMANCE_FEE_BPS, 10_000, Math.Rounding.Floor);
         // Price fee shares using EMA (consistent with settlement pricing).
         // Using spot would let an inflated spot mint cheaper fee shares.
         uint256 feeShares = _convertToSharesAtEma(feeAssets);
@@ -559,7 +576,7 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
         uint256 supply = totalSupply();
         if (supply == 0) return 1e18;
         // Use EMA for consistent pricing with settlement
-        return (emaTotalAssets * 1e18) / supply;
+        return emaTotalAssets.mulDiv(1e18, supply, Math.Rounding.Floor);
     }
 
     /// @notice Check for excessive drawdown and auto-pause if threshold exceeded.
@@ -760,11 +777,22 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
 
     // ─── Admin Functions ────────────────────────────────────────────────
 
-    /// @notice Update the operator address.
-    function setOperator(address _operator) external onlyOperator {
-        if (_operator == address(0)) revert ZeroAddress();
-        operator = _operator;
-        emit OperatorUpdated(_operator);
+    /// @notice Propose a new operator (step 1 of 2-step transfer).
+    /// @dev The pending operator must call acceptOperator() to complete the transfer.
+    function transferOperator(address _pendingOperator) external onlyOperator {
+        if (_pendingOperator == address(0)) revert ZeroAddress();
+        pendingOperator = _pendingOperator;
+        emit OperatorTransferRequested(operator, _pendingOperator);
+    }
+
+    /// @notice Accept the operator role (step 2 of 2-step transfer).
+    /// @dev Only the pending operator can call this.
+    function acceptOperator() external {
+        if (msg.sender != pendingOperator) revert OnlyPendingOperator();
+        if (pendingOperator == address(0)) revert NoPendingOperator();
+        operator = pendingOperator;
+        pendingOperator = address(0);
+        emit OperatorUpdated(msg.sender);
     }
 
     /// @notice Update the fee recipient address.
@@ -842,12 +870,16 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
     /// @notice Called by Chainlink KeystoneForwarder after DON consensus verification.
     /// @dev The Forwarder has already verified that the DON reached consensus on this report.
     ///      We only need to verify msg.sender == chainlinkForwarder.
-    /// @param metadata Workflow identification (workflow name, owner, report name).
+    ///      First parameter (metadata) is unused but required by IReceiver interface.
     /// @param report ABI-encoded payload: (uint8 action, bytes actionData).
-    function onReport(bytes calldata metadata, bytes calldata report) external override {
-        // metadata is unused but required by IReceiver interface
-        (metadata);
-
+    function onReport(
+        bytes calldata,
+        /* metadata */
+        bytes calldata report
+    )
+        external
+        override
+    {
         if (msg.sender != chainlinkForwarder) revert OnlyForwarder();
 
         (uint8 action, bytes memory actionData) = abi.decode(report, (uint8, bytes));
@@ -923,10 +955,11 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
     }
 
     /// @dev Settles current epoch (same logic as existing settleEpoch).
-    /// @param actionData Unused, reserved for future parameters.
-    function _handleSettleEpoch(bytes memory actionData) internal {
-        // actionData is unused for now but reserved for future parameters
-        (actionData);
+    function _handleSettleEpoch(
+        bytes memory /* actionData */
+    )
+        internal
+    {
         _settleCurrentEpoch();
     }
 
@@ -1005,8 +1038,8 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
                 uint256 profit = currentBalance - hwm;
                 lastHarvestedBalance[i] = currentBalance;
 
-                if (profit > 0 && performanceFeeBps > 0 && feeRecipient != address(0)) {
-                    uint256 feeAssets = profit.mulDiv(performanceFeeBps, 10_000, Math.Rounding.Floor);
+                if (profit > 0 && PERFORMANCE_FEE_BPS > 0 && feeRecipient != address(0)) {
+                    uint256 feeAssets = profit.mulDiv(PERFORMANCE_FEE_BPS, 10_000, Math.Rounding.Floor);
                     uint256 feeShares = _convertToSharesAtEma(feeAssets);
 
                     if (feeShares > 0) {
@@ -1021,5 +1054,9 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
 
     function _onlyOperator() internal view {
         if (msg.sender != operator) revert OnlyOperator();
+    }
+
+    function _onlyOperatorOrCRE() internal view {
+        if (msg.sender != operator && msg.sender != chainlinkForwarder) revert OnlyOperator();
     }
 }
