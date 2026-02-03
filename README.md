@@ -1,11 +1,11 @@
 # StreamVault
 
-**An institutional-grade ERC-4626 yield aggregator with async epoch-based withdrawals, multi-strategy yield deployment, EMA-smoothed NAV, Basel III-inspired on-chain risk management, and a decentralized risk oracle powered by Chainlink CRE.**
+**An institutional-grade, UUPS-upgradeable ERC-4626 yield aggregator with async epoch-based withdrawals, multi-strategy yield deployment, EMA-smoothed NAV, Basel III-inspired on-chain risk management, and a decentralized risk oracle powered by Chainlink CRE.**
 
-Built with Foundry, OpenZeppelin v5, and Chainlink CRE SDK. Deployed and verified on Base Sepolia with real Aave V3 integration.
+Built with Foundry, OpenZeppelin v5 (+ Upgradeable extensions), and Chainlink CRE SDK. Deployed on Base Sepolia behind an ERC-1967 proxy with real Aave V3 integration.
 
 ```
-200 tests | 18 test contracts | 6 stateful invariant properties | Live on Base Sepolia
+208 tests | 19 test contracts | 6 stateful invariant properties | UUPS Proxy | Live on Base Sepolia
 ```
 
 ---
@@ -15,6 +15,7 @@ Built with Foundry, OpenZeppelin v5, and Chainlink CRE SDK. Deployed and verifie
 - [The Problem](#the-problem)
 - [What StreamVault Does](#what-streamvault-does)
 - [Architecture](#architecture)
+- [UUPS Upgradeability](#uups-upgradeability)
 - [Chainlink CRE Risk Oracle](#chainlink-cre-risk-oracle)
 - [Live Testnet Deployment](#live-testnet-deployment-base-sepolia)
 - [CRE Simulation Results](#cre-simulation-results)
@@ -94,7 +95,7 @@ Ships with three adapters:
 
 ### What Makes This Different
 
-Five mechanisms run under the hood:
+Six mechanisms run under the hood:
 
 **1. EMA-Smoothed NAV** — Settlement doesn't use spot `totalAssets()`. It uses an exponential moving average that converges over a configurable smoothing period (default 1 hour). A one-block donation barely moves the EMA. An attacker would need to sustain the manipulation for the full smoothing period.
 
@@ -109,6 +110,8 @@ ema += (spot - ema) * elapsed / smoothingPeriod
 **4. Minimum Epoch Duration** — Epochs must be open for at least 5 minutes before settlement. Prevents operator timing attacks on EMA lag.
 
 **5. On-Chain LCR Risk Model** — A Basel III-inspired Liquidity Coverage Ratio model enforces risk constraints on capital deployment. The CRE risk oracle updates haircuts, concentration limits, and risk tiers in real-time.
+
+**6. UUPS Upgradeable Proxy** — The vault is deployed behind an ERC-1967 proxy using the UUPS (ERC-1822) pattern. The operator can upgrade the implementation logic without changing the proxy address or losing state. Storage gaps and ERC-7201 namespaced storage ensure safe upgrades.
 
 ---
 
@@ -125,7 +128,7 @@ graph TB
         F["Fee Recipient"]
     end
 
-    subgraph StreamVault ["StreamVault (ERC-4626 + IReceiver)"]
+    subgraph StreamVault ["StreamVault (UUPS Proxy + ERC-4626 + IReceiver)"]
         direction TB
         D[Deposit Engine]
         WQ[Epoch Withdrawal Queue]
@@ -204,13 +207,92 @@ sequenceDiagram
 
 | Contract | Description |
 | -------- | ----------- |
-| `StreamVault.sol` | Core vault — ERC-4626 + IReceiver, epoch queue, EMA, fees, LCR, drawdown protection |
+| `StreamVault.sol` | Core vault — UUPS-upgradeable ERC-4626 + IReceiver, epoch queue, EMA, fees, LCR, drawdown protection, 2-step operator transfer |
 | `IYieldSource.sol` | Interface for yield connectors: `deposit`, `withdraw`, `balance`, `asset` |
 | `IReceiver.sol` | Chainlink CRE IReceiver interface for `onReport()` |
 | `RiskModel.sol` | Risk parameter structs and LCR computation library |
 | `AaveV3YieldSource.sol` | Aave V3 Pool adapter with utilization and liquidity views |
 | `MorphoYieldSource.sol` | MetaMorpho ERC-4626 vault adapter with market utilization views |
 | `ChainlinkOracle.sol` | Chainlink price feed adapter with decimal normalization |
+
+---
+
+## UUPS Upgradeability
+
+StreamVault uses the **UUPS (Universal Upgradeable Proxy Standard, ERC-1822)** pattern via OpenZeppelin's `UUPSUpgradeable` and `ERC1967Proxy`. This allows the operator to upgrade the vault logic without changing the proxy address or losing any state.
+
+### How It Works
+
+```text
+User ──> ERC1967Proxy (state) ──delegatecall──> Implementation (logic)
+              │                                       │
+              │  upgradeToAndCall(newImpl)             │
+              │──────────────────────────────> New Implementation V2
+```
+
+- **Proxy**: Stores all vault state (balances, epochs, EMA, fees, etc.) at a fixed address
+- **Implementation**: Contains the business logic. Can be swapped by the operator
+- **delegatecall**: Executes implementation code against the proxy's storage
+
+### Upgrade Authorization
+
+Only the operator can authorize upgrades via `_authorizeUpgrade()`:
+
+```solidity
+function _authorizeUpgrade(address) internal override onlyOperator {}
+```
+
+### Initialization
+
+The vault uses `initialize()` instead of a constructor (constructors run on the implementation, not the proxy):
+
+```solidity
+/// @custom:oz-upgrades-unsafe-allow constructor
+constructor() {
+    _disableInitializers(); // prevents init on the bare implementation
+}
+
+function initialize(
+    IERC20 _asset, address _operator, address _feeRecipient,
+    uint256 _performanceFeeBps, uint256 _managementFeeBps,
+    uint256 _smoothingPeriod, string memory _name, string memory _symbol
+) external initializer {
+    __ERC20_init(_name, _symbol);
+    __ERC4626_init(_asset);
+    __Pausable_init();
+    // ... state initialization
+}
+```
+
+### Storage Safety
+
+- **Storage gap**: `uint256[50] private __gap` reserves 50 slots for future state variables in upgrades
+- **ERC-7201 namespaced storage**: OpenZeppelin v5 uses hash-based storage slots for `ERC4626Upgradeable`, `PausableUpgradeable`, and `ReentrancyGuard`, eliminating storage collision risks
+- **Re-initialization protection**: The `initializer` modifier prevents `initialize()` from being called more than once
+
+### Inheritance Chain
+
+```text
+StreamVault is
+    Initializable,              ← OZ upgradeable: init guard
+    ERC4626Upgradeable,         ← OZ upgradeable: vault + ERC-20 (namespaced storage)
+    ReentrancyGuard,            ← OZ non-upgradeable: already proxy-safe in v5 (ERC-7201)
+    PausableUpgradeable,        ← OZ upgradeable: pause mechanism (namespaced storage)
+    UUPSUpgradeable,            ← OZ non-upgradeable: stateless (only provides _authorizeUpgrade)
+    IReceiver                   ← Chainlink CRE callback interface
+```
+
+### Performing an Upgrade
+
+```solidity
+// 1. Deploy new implementation
+StreamVaultV2 newImpl = new StreamVaultV2();
+
+// 2. Operator upgrades the proxy (state is preserved)
+vault.upgradeToAndCall(address(newImpl), "");
+
+// 3. New logic is live — same address, same state
+```
 
 ---
 
@@ -291,16 +373,17 @@ cre/
 
 ## Live Testnet Deployment (Base Sepolia)
 
-The full StreamVault system is deployed on **Base Sepolia** (chain ID 84532) with real Aave V3 integration and a mock ERC-4626 vault as a Morpho stand-in (Morpho has no Base Sepolia deployment).
+The full StreamVault system is deployed on **Base Sepolia** (chain ID 84532) behind a **UUPS proxy (ERC-1967)** with real Aave V3 integration and a mock ERC-4626 vault as a Morpho stand-in (Morpho has no Base Sepolia deployment).
 
 ### Deployed Contracts
 
 | Contract | Address | BaseScan |
 | -------- | ------- | -------- |
-| **StreamVault** | `0x4c088bc94a09a3B11EB5E077eAd7900afE2FF690` | [View](https://sepolia.basescan.org/address/0x4c088bc94a09a3B11EB5E077eAd7900afE2FF690) |
-| **AaveV3YieldSource** | `0xd3eDA3F0FFD0889624a700CD712C31234Fb9Cbb0` | [View](https://sepolia.basescan.org/address/0xd3eDA3F0FFD0889624a700CD712C31234Fb9Cbb0) |
-| **MockERC4626Vault** (Morpho stand-in) | `0x689F6d5CF089DfDF73edAA0738e25fBdDc210EB3` | [View](https://sepolia.basescan.org/address/0x689F6d5CF089DfDF73edAA0738e25fBdDc210EB3) |
-| **MorphoYieldSource** | `0xFA5F8510aaEA7589Cf24d63e2aaDc0b8784B6e35` | [View](https://sepolia.basescan.org/address/0xFA5F8510aaEA7589Cf24d63e2aaDc0b8784B6e35) |
+| **StreamVault Proxy** | `0xfef5a1dF7BE97614d0a744ddE2333A8CD7d8Bf16` | [View](https://sepolia.basescan.org/address/0xfef5a1dF7BE97614d0a744ddE2333A8CD7d8Bf16) |
+| **StreamVault Implementation** | `0x75d7BEE9Ee294BBeDfE1e307b69F41051838F32f` | [View](https://sepolia.basescan.org/address/0x75d7BEE9Ee294BBeDfE1e307b69F41051838F32f) |
+| **AaveV3YieldSource** | `0xA482Cc7eA5C91AF4c219E0Fb898aFbe3Ad66Ba99` | [View](https://sepolia.basescan.org/address/0xA482Cc7eA5C91AF4c219E0Fb898aFbe3Ad66Ba99) |
+| **MockERC4626Vault** (Morpho stand-in) | `0x46E3F1C4729444e9b105b293E2F332FA6f692415` | [View](https://sepolia.basescan.org/address/0x46E3F1C4729444e9b105b293E2F332FA6f692415) |
+| **MorphoYieldSource** | `0x343bF9575518b91D398fb1d776804004Aa82aA7e` | [View](https://sepolia.basescan.org/address/0x343bF9575518b91D398fb1d776804004Aa82aA7e) |
 
 ### External Contracts Used
 
@@ -311,18 +394,19 @@ The full StreamVault system is deployed on **Base Sepolia** (chain ID 84532) wit
 | Aave aUSDC | `0x10F1A9D11CDf50041f3f8cB7191CBE2f31750ACC` |
 | CRE Forwarder | `0x82300bd7c3958625581cc2f77bc6464dcecdf3e5` |
 
-### Deployment Transactions
+### Deployment Transactions (UUPS Proxy)
 
 | Step | Transaction |
 | ---- | ----------- |
-| Deploy StreamVault | [`0x9916f181...`](https://sepolia.basescan.org/tx/0x9916f181da5409122cc61b472d6936a37573946c00ca0e2cea8cd3b3d2cf7f1b) |
-| Deploy AaveV3YieldSource | [`0x8f0c353d...`](https://sepolia.basescan.org/tx/0x8f0c353df28d04e5f74f0db8cbeffa168f3e8978d80d0076b64966b57b57d71b) |
-| Deploy MockERC4626Vault | [`0xee1760a1...`](https://sepolia.basescan.org/tx/0xee1760a16bc0f987d7aa1440ab69e9f60575d18e907bf6322fb0675e9847a6ea) |
-| Deploy MorphoYieldSource | [`0x979db346...`](https://sepolia.basescan.org/tx/0x979db346c31a6ed9222bac410b4ac6b46b2b48c98a29b937a7ded9f1da9a96d7) |
-| Register Aave source | [`0x6bd06d14...`](https://sepolia.basescan.org/tx/0x6bd06d1441ff9d115716b3cb41e71ac27fdb33f7f9e47ec04f4de9fc973d084e) |
-| Register Morpho source | [`0x62683121...`](https://sepolia.basescan.org/tx/0x626831218f0805bf22042f8c380cd2881dc16ba097289e0107b2409b49deeedc) |
-| Set CRE Forwarder | [`0xd4cd5e23...`](https://sepolia.basescan.org/tx/0xd4cd5e2306427676b9cb24bbfe476932afccf45bce82b4a34d7a630cc75ded0e) |
-| Set LCR Floor (120%) | [`0xd38f4dda...`](https://sepolia.basescan.org/tx/0xd38f4ddae2fed0d626dccf020b47631a69805421a82ce16d9b3e75a0900c3c28) |
+| Deploy StreamVault Implementation | [`0xd7df2a70...`](https://sepolia.basescan.org/tx/0xd7df2a708e6a1fc6e99a4158dab0b6a78ade89287529f2b033ab4c4dec79ccfe) |
+| Deploy ERC1967Proxy (+ initialize) | [`0x1b4c5add...`](https://sepolia.basescan.org/tx/0x1b4c5add32ebf0c0920962b934d909f5f46d9d313cd3f4f4ca6b7e92e642b9db) |
+| Deploy AaveV3YieldSource | [`0x22a0a236...`](https://sepolia.basescan.org/tx/0x22a0a236562f7482c693abc0336e6a09816961cd448a9af37f8e34f4674824a3) |
+| Deploy MockERC4626Vault | [`0x6fe60650...`](https://sepolia.basescan.org/tx/0x6fe606505a3bf7fb58b9fd71f0c913247eff2e6cb1b3bb95d82af02c9bdbf188) |
+| Deploy MorphoYieldSource | [`0xdf7b03ae...`](https://sepolia.basescan.org/tx/0xdf7b03aeb4ca1a67e858b29a43111e09750c4898d125202fb1cad1e777cdc0c6) |
+| Register Aave source | [`0xcc45930a...`](https://sepolia.basescan.org/tx/0xcc45930a5d8472a412ddc65d0b434019643254c7982d6311ebc49fcea2a6889a) |
+| Register Morpho source | [`0xff0a516e...`](https://sepolia.basescan.org/tx/0xff0a516eb5a390aa75bfcf44f1779e69652f8083fa02cb0207cb679467c10833) |
+| Set CRE Forwarder | [`0x8ddafdd5...`](https://sepolia.basescan.org/tx/0x8ddafdd57ba9595a0f8443e23ec9268592e92e81f0ff7a88fd94ca5ea96ace9c) |
+| Set LCR Floor (120%) | [`0x12d91170...`](https://sepolia.basescan.org/tx/0x12d911709a9f1f723e809ebf7f295c2af1116585b34665a0379cb03527c838ef) |
 
 ### End-to-End Demo Transactions
 
@@ -361,7 +445,7 @@ After deployment, the following features were individually verified on the live 
 
 ## CRE Simulation Results
 
-The CRE risk monitor workflow was simulated using `cre workflow simulate` against the **live deployed contracts** on Base Sepolia. The simulation reads real on-chain state, runs the full risk model, generates a DON-signed report, and simulates the write transaction.
+The CRE risk monitor workflow was simulated using `cre workflow simulate` against the **live UUPS proxy deployment** on Base Sepolia. The simulation reads real on-chain state through the proxy, runs the full risk model, generates a DON-signed report, and simulates the write transaction.
 
 ### Simulation Output
 
@@ -369,37 +453,37 @@ The CRE risk monitor workflow was simulated using `cre workflow simulate` agains
 [SIMULATION] Running trigger trigger=cron-trigger@1.0.0
 
 [USER LOG] CRE Risk Monitor: Starting health check
-[USER LOG]   Execution time: 2026-02-03T11:45:57.217Z
+[USER LOG]   Execution time: 2026-02-03T15:10:58.401Z
 
 [USER LOG] [Step 1] Reading protocol health metrics...
   -- 10 on-chain reads via EVMClient (DON consensus) --
-  Aave utilization: 3315 bps        (33.15% -- real Base Sepolia Aave pool)
-  Aave liquidity:   500,000,006     (500 USDC available in pool)
+  Aave utilization: 3312 bps        (33.12% -- real Base Sepolia Aave pool)
+  Aave liquidity:   5,000,000,177   (5000 USDC available in pool)
   Morpho utilization: 0 bps         (mock vault, no utilization)
-  Morpho liquidity:   0
-  Vault TVL:          1,000,000,006 (1000 USDC total assets)
-  Aave balance:       500,000,006   (500 USDC deployed + yield accrued)
-  Morpho balance:     0
-  Idle balance:       500,000,000   (500 USDC in vault)
+  Morpho liquidity:   3,000,000,000 (3000 USDC in mock vault)
+  Vault TVL:          10,000,000,177 (10,000 USDC total assets)
+  Aave balance:       5,000,000,177 (5000 USDC deployed + yield accrued)
+  Morpho balance:     3,000,000,000 (3000 USDC deployed)
+  Idle balance:       2,000,000,000 (2000 USDC in vault)
   Pending withdrawals: 0
 
 [USER LOG] [Step 2] Computing risk model...
-  Aave risk score:   3822/10000     (moderate -- 33% utilization, concentration at 50%)
-  Morpho risk score: 0/10000        (no exposure)
-  Stressed LCR:      30833 bps      (308% -- well above 120% floor)
+  Aave risk score:   3822/10000     (moderate -- 33% utilization, 50% concentration)
+  Morpho risk score: 3449/10000     (moderate -- 30% concentration)
+  Stressed LCR:      29333 bps      (293% -- well above 120% floor)
   System status:     GREEN
   Decided action:    UPDATE_PARAMS
   New params:
     Aave haircut:         1500 bps  (15%)
     Aave concentration:   6000 bps  (60% max)
-    Morpho haircut:       500 bps   (5%)
+    Morpho haircut:       1500 bps  (15%)
     Morpho concentration: 6000 bps  (60% max)
 
 [USER LOG] [Step 3] Generating DON-signed report for: UPDATE_PARAMS
   -- consensus@1.0.0-alpha COMPLETED --
 
 [USER LOG] [Step 4] Submitting report to vault via KeystoneForwarder...
-  Target: 0x4c088bc94a09a3B11EB5E077eAd7900afE2FF690
+  Target: 0xfef5a1dF7BE97614d0a744ddE2333A8CD7d8Bf16 (proxy)
   -- evm write COMPLETED --
 
 [USER LOG] [Complete] Transaction successful!
@@ -410,13 +494,13 @@ WorkflowExecutionFinished - Status: SUCCESS
 
 ### What the Simulation Proves
 
-1. **Real on-chain reads work** — The workflow read 10 data points from the live deployed contracts (vault state, Aave utilization, source balances) via CRE's `EVMClient.callContract()` with DON consensus.
+1. **UUPS proxy is transparent to CRE** — The workflow reads and writes through the proxy address identically to a non-proxied contract. All 10 on-chain reads (vault state, Aave utilization, source balances) returned correct data via `delegatecall`.
 
-2. **Risk model produces correct outputs** — Aave at 33% utilization and 50% concentration scored 3822/10000 (moderate). The stressed LCR of 308% is well above the 120% floor, correctly yielding GREEN status.
+2. **Risk model produces correct outputs** — Aave at 33% utilization and 50% concentration scored 3822/10000 (moderate). Morpho at 30% concentration scored 3449/10000. The stressed LCR of 293% is well above the 120% floor, correctly yielding GREEN status.
 
 3. **Report generation works** — The DON consensus and ECDSA signing completed successfully, producing a valid report payload.
 
-4. **Write path works** — The simulated `writeReport()` to the vault address completed, demonstrating the full Forwarder -> `onReport()` path.
+4. **Write path works through proxy** — The simulated `writeReport()` to the proxy address completed, demonstrating the full Forwarder -> Proxy -> `onReport()` delegatecall path.
 
 5. **Deterministic execution** — The workflow compiled to WASM (0.61 MB), ran identically across the simulated node, and produced consistent results.
 
@@ -436,19 +520,30 @@ The workflow will then run every 5 minutes on the Chainlink DON, autonomously mo
 
 ## Usage
 
-### Deploying the Vault
+### Deploying the Vault (UUPS Proxy)
 
 ```solidity
-StreamVault vault = new StreamVault(
-    IERC20(usdcAddress),       // underlying asset (e.g. USDC)
-    operatorAddress,           // trusted operator
-    feeRecipientAddress,       // receives fee shares
-    1000,                      // 10% performance fee (bps)
-    200,                       // 2% annual management fee (bps)
-    3600,                      // 1-hour EMA smoothing period (seconds)
-    "StreamVault USDC",        // ERC-20 name
-    "svUSDC"                   // ERC-20 symbol
+// 1. Deploy implementation (constructor disables initializers)
+StreamVault implementation = new StreamVault();
+
+// 2. Encode initialize calldata
+bytes memory initData = abi.encodeCall(
+    StreamVault.initialize,
+    (
+        IERC20(usdcAddress),       // underlying asset (e.g. USDC)
+        operatorAddress,           // trusted operator
+        feeRecipientAddress,       // receives fee shares
+        1000,                      // 10% performance fee (bps)
+        200,                       // 2% annual management fee (bps)
+        3600,                      // 1-hour EMA smoothing period (seconds)
+        "StreamVault USDC",        // ERC-20 name
+        "svUSDC"                   // ERC-20 symbol
+    )
 );
+
+// 3. Deploy proxy — this calls initialize() on the proxy's storage
+ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
+StreamVault vault = StreamVault(address(proxy));
 ```
 
 ### User Flow: Depositing
@@ -519,13 +614,20 @@ vault.getUserWithdrawRequest(epoch, user); // User's claim info
 ### Admin Functions
 
 ```solidity
-vault.setOperator(newOperator);
+// 2-step operator transfer (prevents accidental transfers)
+vault.transferOperator(newOperator);     // Step 1: propose
+// newOperator calls:
+vault.acceptOperator();                  // Step 2: accept
+
 vault.setFeeRecipient(newRecipient);
 vault.setManagementFee(100);            // 1% annual
 vault.setSmoothingPeriod(7200);         // 2-hour EMA
 vault.setMaxDrawdown(1500);             // 15% circuit breaker
 vault.pause();                          // Emergency pause
 vault.unpause();                        // Resume
+
+// UUPS upgrade (operator only)
+vault.upgradeToAndCall(address(newImpl), "");
 ```
 
 ---
@@ -536,17 +638,21 @@ vault.unpause();                        // Resume
 
 | Role | Capabilities |
 | ---- | ----------- |
-| **Admin** | Set operator, fee recipient, CRE forwarder, management fee, smoothing period, drawdown threshold, LCR floor, yield source management, pause/unpause |
-| **Operator** | Deploy/withdraw capital, settle epochs, harvest yield |
+| **Operator** | Deploy/withdraw capital, settle epochs, harvest yield, upgrade implementation (UUPS), 2-step transfer operator, set fee recipient, CRE forwarder, management fee, smoothing period, drawdown threshold, LCR floor, yield source management, pause/unpause |
+| **Pending Operator** | Accept operator role (2-step transfer) |
 | **CRE Forwarder** | Call `onReport()` with DON-signed risk updates, rebalances, emergency actions |
 | **User** | Deposit, request withdraw, claim from settled epochs |
 
 ### Protections
 
-- **ReentrancyGuard** on all state-changing functions
+- **UUPS upgradeable proxy** — operator-gated `_authorizeUpgrade()`, storage gap (`__gap[50]`), `_disableInitializers()` on implementation
+- **2-step operator transfer** — `transferOperator()` + `acceptOperator()` prevents accidental transfers to wrong addresses
+- **Custom errors** — gas-efficient custom errors (`OnlyOperator`, `SyncWithdrawDisabled`, etc.) instead of revert strings
+- **ReentrancyGuard** on all state-changing functions (proxy-safe via ERC-7201 namespaced storage)
 - **Inflation attack protection** via `_decimalsOffset() = 3` (1e3 virtual shares/assets)
 - **Rounding** always floors in favor of the vault (standard ERC-4626 convention)
-- **Zero-address checks** on constructor params and admin setters
+- **Zero-address checks** on initializer params, admin setters, and adapter constructors
+- **ERC-4626 compliance** — `maxDeposit()` / `maxMint()` return 0 when paused per spec
 - **Fee caps**: performance fee <= 50%, management fee <= 5% annual
 - **Yield source cap**: maximum 20 connectors
 - **EMA bounds**: floor at 95% of spot, minimum at virtual offset
@@ -555,13 +661,15 @@ vault.unpause();                        // Resume
 - **Per-source high water marks**: loss recovery doesn't count as new profit
 - **Net-asset fee base**: management fees exclude claimable assets
 - **EMA-consistent fee pricing**: fee shares priced via EMA, consistent with settlement
+- **`mulDiv` precision** — `navPerShare()` uses OpenZeppelin `mulDiv` to avoid rounding errors
 - **Actual-amount transfers**: adapters measure real balance changes, not requested amounts
 - **`onlyVault` guards** on all yield source adapters
-- **Disabled sync withdrawals**: `withdraw()`, `redeem()` revert — async only
+- **Disabled sync withdrawals**: `withdraw()`, `redeem()` revert with `SyncWithdrawDisabled` — async only
 - **LCR enforcement**: `deployToYield()` reverts if LCR would breach floor
 - **Concentration limits**: per-source deployment capped by CRE-updated `maxConcentrationBps`
 - **Risk param bounds**: haircuts capped at 95%, validated on every CRE update
 - **Drawdown circuit breaker**: auto-pause on NAV drop > threshold from HWM
+- **Re-initialization protection**: `initializer` modifier prevents double-initialization on proxy
 
 ### Emergency Pause
 
@@ -588,7 +696,7 @@ forge build
 ### Run Tests
 
 ```shell
-forge test           # 200 tests across 18 contracts
+forge test           # 208 tests across 19 contracts
 forge test -vv       # verbose with gas
 ```
 
@@ -608,25 +716,26 @@ slither . --filter-paths "lib/,test/" --exclude naming-convention,pragma,solc-ve
 
 ### Test Suite
 
-200 tests across 18 test contracts covering every feature:
+208 tests across 19 test contracts covering every feature:
 
 | Test Contract | Tests | Coverage |
 | ------------- | ----- | -------- |
-| `Constructor_Test` | 8 | Parameter validation, boundary values, zero-address revert |
+| `Constructor_Test` | 8 | Parameter validation, boundary values, zero-address revert (proxy-aware) |
 | `Deposit_Test` | 6 | First deposit, EMA snap, proportionality, totalAssets consistency |
 | `Withdrawal_Test` | 19 | Full lifecycle, double-claim revert, multi-user pro-rata, disabled sync paths |
 | `YieldSource_Test` | 14 | Add/remove, asset mismatch, 20-source cap, waterfall pull |
 | `Harvest_Test` | 6 | HWM gating, per-source tracking, loss recovery |
 | `EMA_Test` | 7 | Convergence, interpolation, 95% floor, donation resistance |
 | `ManagementFee_Test` | 8 | Time-proportional accrual, ~2% dilution, net-asset base |
-| `Admin_Test` | 11 | All access control guards, zero-address reverts |
+| `Admin_Test` | 12 | 2-step operator transfer, access control guards, zero-address reverts |
+| `Upgrade_Test` | 5 | UUPS upgrade authorization, state preservation, re-initialization prevention, implementation lock |
 | `Invariant_Test` | 6 | `totalAssets == idle + deployed - claimable`, roundtrip, inflation |
 | `Fuzz_Test` | 6 | Fuzzed deposit/withdraw roundtrip, EMA floor, fee proportionality |
 | `StatefulInvariant_Test` | 6 | Foundry invariant testing: 8 entry points, 5 actors, 128k calls, 6 properties |
 | `Reentrancy_Test` | 2 | Malicious ERC-20 callback attacks blocked by ReentrancyGuard |
-| `ERC4626Compliance_Test` | 21 | Full ERC-4626 spec: convertTo*, max*, preview*, fuzzed monotonicity |
+| `ERC4626Compliance_Test` | 21 | Full ERC-4626 spec: convertTo\*, max\*, preview\*, fuzzed monotonicity |
 | `ViewAndBatch_Test` | 9 | View functions, batch claims, claimable exclusion |
-| `Pause_Test` | 11 | Pause/unpause, blocked operations, allowed exits |
+| `Pause_Test` | 13 | Pause/unpause, blocked operations, allowed exits, maxDeposit/maxMint return 0 |
 | `Drawdown_Test` | 13 | Circuit breaker, HWM updates, threshold config |
 | `ChainlinkOracle_Test` | 16 | Price normalization (6/8/18 dec), staleness, fuzz tests |
 | `StreamVaultCRE_Test` | 31 | Forwarder config, `onReport()` access control, all 5 actions, LCR enforcement, concentration limits, full integration cycle, backwards compatibility |
@@ -644,12 +753,14 @@ slither . --filter-paths "lib/,test/" --exclude naming-convention,pragma,solc-ve
 
 ## Project Structure
 
-```
+```text
 o-vault/
   src/
-    StreamVault.sol              # Core vault (ERC-4626 + IReceiver + LCR)
+    StreamVault.sol              # Core vault (UUPS + ERC-4626 + IReceiver + LCR)
     AaveV3YieldSource.sol        # Aave V3 Pool adapter
     MorphoYieldSource.sol        # MetaMorpho ERC-4626 adapter
+    ChainlinkOracle.sol          # Chainlink price feed adapter
+    MockYieldSource.sol          # Configurable-rate mock for testing
     interfaces/
       IYieldSource.sol           # Yield source connector interface
       IReceiver.sol              # Chainlink CRE IReceiver
@@ -657,13 +768,15 @@ o-vault/
     libraries/
       RiskModel.sol              # Risk param structs + LCR logic
   test/
-    StreamVault.t.sol            # Core tests (deposit, withdraw, yield, fees, etc.)
-    StreamVaultAdvanced.t.sol    # Invariant, fuzz, reentrancy, ERC-4626 compliance
+    StreamVault.t.sol            # Core tests (constructor, deposit, withdraw, yield, fees, upgrade, etc.)
+    StreamVaultAdvanced.t.sol    # Invariant, fuzz, reentrancy, ERC-4626 compliance, pause, drawdown
     StreamVaultCRE.t.sol         # CRE integration tests (31 tests)
     ChainlinkOracle.t.sol        # Oracle adapter tests
+    mocks/
+      MockERC20.sol              # Test token
   script/
-    Deploy.s.sol                 # Generic deployment
-    DeployBaseSepolia.s.sol      # Base Sepolia deployment
+    Deploy.s.sol                 # Generic UUPS proxy deployment
+    DeployBaseSepolia.s.sol      # Base Sepolia proxy deployment
     DemoE2E.s.sol                # End-to-end demo script
     mocks/
       MockERC4626Vault.sol       # Morpho stand-in for testnet
@@ -677,7 +790,9 @@ o-vault/
       workflow.yaml              # Workflow targets
   lib/
     forge-std/
-    openzeppelin-contracts/
+    openzeppelin-contracts/               # OZ v5.5.0
+    openzeppelin-contracts-upgradeable/   # OZ Upgradeable v5.5.0
+  remappings.txt                 # IDE remappings for Solidity extension
 ```
 
 ---

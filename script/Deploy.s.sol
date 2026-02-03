@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Script, console} from "forge-std/Script.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {StreamVault} from "../src/StreamVault.sol";
 import {AaveV3YieldSource} from "../src/AaveV3YieldSource.sol";
 import {MorphoYieldSource} from "../src/MorphoYieldSource.sol";
@@ -61,18 +62,19 @@ contract DeployStreamVault is Script {
 
         vm.startBroadcast(deployerKey);
 
-        StreamVault vault = new StreamVault(
-            IERC20(asset),
-            operatorAddr,
-            feeRecipient,
-            performanceFeeBps,
-            managementFeeBps,
-            smoothingPeriod,
-            vaultName,
-            vaultSymbol
-        );
+        // Deploy implementation (constructor disables initializers)
+        StreamVault implementation = new StreamVault();
+        console.log("StreamVault implementation:", address(implementation));
 
-        console.log("StreamVault deployed at:", address(vault));
+        // Deploy UUPS proxy with initialize calldata
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (IERC20(asset), operatorAddr, feeRecipient, performanceFeeBps, managementFeeBps, smoothingPeriod, vaultName, vaultSymbol)
+        );
+        ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
+        StreamVault vault = StreamVault(address(proxy));
+
+        console.log("StreamVault proxy:", address(vault));
 
         // ─── Deploy Aave Adapter (optional) ─────────────────────────────────
 
@@ -126,18 +128,25 @@ contract DeploySepolia is Script {
 
         vm.startBroadcast(deployerKey);
 
-        StreamVault vault = new StreamVault(
-            IERC20(usdc),
-            operatorAddr,
-            operatorAddr, // feeRecipient = operator for testnet
-            1_000, // 10% performance fee
-            200, // 2% management fee
-            3_600, // 1 hour smoothing
-            "StreamVault USDC (Sepolia)",
-            "svUSDC"
+        StreamVault implementation = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (
+                IERC20(usdc),
+                operatorAddr,
+                operatorAddr,
+                1_000,
+                200,
+                3_600,
+                "StreamVault USDC (Sepolia)",
+                "svUSDC"
+            )
         );
+        ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
+        StreamVault vault = StreamVault(address(proxy));
 
-        console.log("StreamVault (Sepolia):", address(vault));
+        console.log("StreamVault implementation:", address(implementation));
+        console.log("StreamVault proxy:", address(vault));
 
         vm.stopBroadcast();
     }

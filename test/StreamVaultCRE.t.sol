@@ -7,6 +7,7 @@ import {MockYieldSource} from "../src/MockYieldSource.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {RiskModel} from "../src/libraries/RiskModel.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 /// @title StreamVault CRE Integration Tests
 /// @notice Comprehensive tests for Chainlink CRE (Compute Runtime Environment) integration.
@@ -33,17 +34,14 @@ contract StreamVaultCRE_Test is Test {
         // Deploy USDC mock
         usdc = new MockERC20("USDC", "USDC", 6);
 
-        // Deploy vault
-        vault = new StreamVault(
-            IERC20(address(usdc)),
-            operator,
-            feeRecipient,
-            PERFORMANCE_FEE_BPS,
-            MANAGEMENT_FEE_BPS,
-            SMOOTHING_PERIOD,
-            "StreamVault USDC",
-            "svUSDC"
+        // Deploy vault (UUPS proxy)
+        StreamVault implementation = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (IERC20(address(usdc)), operator, feeRecipient, PERFORMANCE_FEE_BPS, MANAGEMENT_FEE_BPS, SMOOTHING_PERIOD, "StreamVault USDC", "svUSDC")
         );
+        ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
+        vault = StreamVault(address(proxy));
 
         // Deploy yield sources
         aaveSource = new MockYieldSource(address(usdc), address(vault), 0);

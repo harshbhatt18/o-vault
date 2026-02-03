@@ -3,12 +3,34 @@ pragma solidity ^0.8.20;
 
 import {Test, StdInvariant} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {StreamVault} from "../src/StreamVault.sol";
 import {IYieldSource} from "../src/IYieldSource.sol";
 import {MockYieldSource} from "../src/MockYieldSource.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {ReentrantERC20} from "./mocks/ReentrantERC20.sol";
+
+/// @dev Helper for deploying StreamVault behind a UUPS proxy in tests.
+abstract contract ProxyDeployHelper {
+    function _deployVaultProxy(
+        IERC20 _asset,
+        address _operator,
+        address _feeRecipient,
+        uint256 _perfFee,
+        uint256 _mgmtFee,
+        uint256 _smoothing,
+        string memory _name,
+        string memory _symbol
+    ) internal returns (StreamVault) {
+        StreamVault impl = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize, (_asset, _operator, _feeRecipient, _perfFee, _mgmtFee, _smoothing, _name, _symbol)
+        );
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
+        return StreamVault(address(proxy));
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Invariant Handler — randomly sequences vault operations
@@ -138,7 +160,7 @@ contract VaultHandler is Test {
 // 11. True Stateful Invariant Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-contract StreamVault_StatefulInvariant_Test is StdInvariant, Test {
+contract StreamVault_StatefulInvariant_Test is StdInvariant, Test, ProxyDeployHelper {
     MockERC20 internal usdc;
     StreamVault internal vault;
     MockYieldSource internal yieldSource;
@@ -149,7 +171,7 @@ contract StreamVault_StatefulInvariant_Test is StdInvariant, Test {
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
-        vault = new StreamVault(
+        vault = _deployVaultProxy(
             IERC20(address(usdc)), operator, feeRecipient, 1_000, 200, 3_600, "StreamVault USDC", "svUSDC"
         );
         yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
@@ -236,7 +258,7 @@ contract StreamVault_StatefulInvariant_Test is StdInvariant, Test {
 // 12. Reentrancy with Malicious ERC-20
 // ─────────────────────────────────────────────────────────────────────────────
 
-contract StreamVault_Reentrancy_Test is Test {
+contract StreamVault_Reentrancy_Test is Test, ProxyDeployHelper {
     ReentrantERC20 internal reentrantToken;
     StreamVault internal vault;
     MockYieldSource internal yieldSource;
@@ -247,8 +269,9 @@ contract StreamVault_Reentrancy_Test is Test {
 
     function setUp() public {
         reentrantToken = new ReentrantERC20();
-        vault =
-            new StreamVault(IERC20(address(reentrantToken)), operator, feeRecipient, 1_000, 200, 3_600, "RV", "rVault");
+        vault = _deployVaultProxy(
+            IERC20(address(reentrantToken)), operator, feeRecipient, 1_000, 200, 3_600, "RV", "rVault"
+        );
         yieldSource = new MockYieldSource(address(reentrantToken), address(vault), 0);
 
         vm.prank(operator);
@@ -311,7 +334,7 @@ contract StreamVault_Reentrancy_Test is Test {
 // 13. ERC-4626 Compliance Suite
 // ─────────────────────────────────────────────────────────────────────────────
 
-contract StreamVault_ERC4626Compliance_Test is Test {
+contract StreamVault_ERC4626Compliance_Test is Test, ProxyDeployHelper {
     MockERC20 internal usdc;
     StreamVault internal vault;
     MockYieldSource internal yieldSource;
@@ -323,7 +346,7 @@ contract StreamVault_ERC4626Compliance_Test is Test {
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
-        vault = new StreamVault(
+        vault = _deployVaultProxy(
             IERC20(address(usdc)), operator, feeRecipient, 1_000, 200, 3_600, "StreamVault USDC", "svUSDC"
         );
         yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
@@ -529,7 +552,7 @@ contract StreamVault_ERC4626Compliance_Test is Test {
 // 14. View Functions & Batch Claim Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-contract StreamVault_ViewAndBatch_Test is Test {
+contract StreamVault_ViewAndBatch_Test is Test, ProxyDeployHelper {
     MockERC20 internal usdc;
     StreamVault internal vault;
     MockYieldSource internal yieldSource;
@@ -543,7 +566,7 @@ contract StreamVault_ViewAndBatch_Test is Test {
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
-        vault = new StreamVault(
+        vault = _deployVaultProxy(
             IERC20(address(usdc)), operator, feeRecipient, 1_000, 200, 3_600, "StreamVault USDC", "svUSDC"
         );
         yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
@@ -727,7 +750,7 @@ contract StreamVault_ViewAndBatch_Test is Test {
 // 15. Emergency Pause Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-contract StreamVault_Pause_Test is Test {
+contract StreamVault_Pause_Test is Test, ProxyDeployHelper {
     MockERC20 internal usdc;
     StreamVault internal vault;
     MockYieldSource internal yieldSource;
@@ -739,7 +762,7 @@ contract StreamVault_Pause_Test is Test {
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
-        vault = new StreamVault(
+        vault = _deployVaultProxy(
             IERC20(address(usdc)), operator, feeRecipient, 1_000, 200, 3_600, "StreamVault USDC", "svUSDC"
         );
         yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
@@ -929,7 +952,7 @@ contract StreamVault_Pause_Test is Test {
 // 16. Drawdown Protection Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-contract StreamVault_Drawdown_Test is Test {
+contract StreamVault_Drawdown_Test is Test, ProxyDeployHelper {
     MockERC20 internal usdc;
     StreamVault internal vault;
     MockYieldSource internal yieldSource;
@@ -942,7 +965,7 @@ contract StreamVault_Drawdown_Test is Test {
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
-        vault = new StreamVault(
+        vault = _deployVaultProxy(
             IERC20(address(usdc)), operator, feeRecipient, 1_000, 200, 3_600, "StreamVault USDC", "svUSDC"
         );
         yieldSource = new MockYieldSource(address(usdc), address(vault), 1);

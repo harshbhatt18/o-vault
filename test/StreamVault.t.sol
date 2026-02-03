@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {StreamVault} from "../src/StreamVault.sol";
 import {IYieldSource} from "../src/IYieldSource.sol";
@@ -37,18 +38,11 @@ abstract contract StreamVaultTestBase is Test {
     function setUp() public virtual {
         usdc = new MockERC20("USD Coin", "USDC", 6);
 
-        vault = new StreamVault(
-            IERC20(address(usdc)),
-            operator,
-            feeRecipient,
-            PERF_FEE_BPS,
-            MGMT_FEE_BPS,
-            SMOOTHING,
-            "StreamVault USDC",
-            "svUSDC"
+        vault = _deployVault(
+            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "StreamVault USDC", "svUSDC"
         );
 
-        // Deploy mock yield source wired to vault
+        // Deploy mock yield source wired to vault (proxy address)
         yieldSource = new MockYieldSource(address(usdc), address(vault), YIELD_RATE);
 
         // Register yield source
@@ -58,6 +52,25 @@ abstract contract StreamVaultTestBase is Test {
         // Disable drawdown protection for existing tests (backward compatibility)
         vm.prank(operator);
         vault.setMaxDrawdown(0);
+    }
+
+    /// @dev Deploy StreamVault via UUPS proxy pattern.
+    function _deployVault(
+        IERC20 _asset,
+        address _operator,
+        address _feeRecipient,
+        uint256 _perfFee,
+        uint256 _mgmtFee,
+        uint256 _smoothing,
+        string memory _name,
+        string memory _symbol
+    ) internal returns (StreamVault) {
+        StreamVault impl = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize, (_asset, _operator, _feeRecipient, _perfFee, _mgmtFee, _smoothing, _name, _symbol)
+        );
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
+        return StreamVault(address(proxy));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -105,46 +118,68 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
     }
 
     function test_revert_zeroOperator() public {
-        vm.expectRevert(StreamVault.ZeroAddress.selector);
-        new StreamVault(
-            IERC20(address(usdc)), address(0), feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V"
+        StreamVault impl = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (IERC20(address(usdc)), address(0), feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V")
         );
+        vm.expectRevert(StreamVault.ZeroAddress.selector);
+        new ERC1967Proxy(address(impl), initData);
     }
 
     function test_revert_perfFeeTooHigh() public {
+        StreamVault impl = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (IERC20(address(usdc)), operator, feeRecipient, 5_001, MGMT_FEE_BPS, SMOOTHING, "V", "V")
+        );
         vm.expectRevert(StreamVault.FeeTooHigh.selector);
-        new StreamVault(IERC20(address(usdc)), operator, feeRecipient, 5_001, MGMT_FEE_BPS, SMOOTHING, "V", "V");
+        new ERC1967Proxy(address(impl), initData);
     }
 
     function test_revert_mgmtFeeTooHigh() public {
+        StreamVault impl = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 501, SMOOTHING, "V", "V")
+        );
         vm.expectRevert(StreamVault.FeeTooHigh.selector);
-        new StreamVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 501, SMOOTHING, "V", "V");
+        new ERC1967Proxy(address(impl), initData);
     }
 
     function test_revert_smoothingTooLow() public {
+        StreamVault impl = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 299, "V", "V")
+        );
         vm.expectRevert(StreamVault.InvalidSmoothingPeriod.selector);
-        new StreamVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 299, "V", "V");
+        new ERC1967Proxy(address(impl), initData);
     }
 
     function test_revert_smoothingTooHigh() public {
+        StreamVault impl = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 86_401, "V", "V")
+        );
         vm.expectRevert(StreamVault.InvalidSmoothingPeriod.selector);
-        new StreamVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 86_401, "V", "V");
+        new ERC1967Proxy(address(impl), initData);
     }
 
     function test_boundaryValues_perfFeeMax() public {
         StreamVault v =
-            new StreamVault(IERC20(address(usdc)), operator, feeRecipient, 5_000, MGMT_FEE_BPS, SMOOTHING, "V", "V");
+            _deployVault(IERC20(address(usdc)), operator, feeRecipient, 5_000, MGMT_FEE_BPS, SMOOTHING, "V", "V");
         assertEq(v.PERFORMANCE_FEE_BPS(), 5_000);
     }
 
     function test_boundaryValues_smoothingBounds() public {
         StreamVault vMin =
-            new StreamVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 300, "V", "V");
+            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 300, "V", "V");
         assertEq(vMin.smoothingPeriod(), 300);
 
-        StreamVault vMax = new StreamVault(
-            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 86_400, "V", "V"
-        );
+        StreamVault vMax =
+            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 86_400, "V", "V");
         assertEq(vMax.smoothingPeriod(), 86_400);
     }
 }
@@ -655,9 +690,8 @@ contract StreamVault_EMA_Test is StreamVaultTestBase {
 
     function test_ema_firstDepositSnaps() public {
         // Deploy a fresh vault
-        StreamVault v2 = new StreamVault(
-            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V2", "V2"
-        );
+        StreamVault v2 =
+            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V2", "V2");
         assertEq(v2.emaTotalAssets(), 1000); // virtual offset
 
         usdc.mint(alice, 5_000e6);
@@ -775,7 +809,7 @@ contract StreamVault_ManagementFee_Test is StreamVaultTestBase {
 
     function test_mgmtFee_zeroFee_noAccrual() public {
         StreamVault v2 =
-            new StreamVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 0, SMOOTHING, "V2", "V2");
+            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 0, SMOOTHING, "V2", "V2");
 
         usdc.mint(alice, INITIAL_DEPOSIT);
         vm.startPrank(alice);
@@ -1170,5 +1204,87 @@ contract StreamVault_Fuzz_Test is StreamVaultTestBase {
 
         (,, uint256 assetsOwed,) = vault.epochs(epochId);
         assertLe(assetsOwed, totalAssetsBefore + 1);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. UUPS Upgrade Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// @dev Minimal V2 contract for upgrade testing — adds a version getter
+contract StreamVaultV2 is StreamVault {
+    function version() external pure returns (uint256) {
+        return 2;
+    }
+}
+
+contract StreamVault_Upgrade_Test is StreamVaultTestBase {
+    function test_upgradeToAndCall_onlyOperator() public {
+        StreamVaultV2 v2Impl = new StreamVaultV2();
+
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.upgradeToAndCall(address(v2Impl), "");
+    }
+
+    function test_upgradeToAndCall_success() public {
+        StreamVaultV2 v2Impl = new StreamVaultV2();
+
+        vm.prank(operator);
+        vault.upgradeToAndCall(address(v2Impl), "");
+
+        // Cast to V2 and verify new function is accessible
+        StreamVaultV2 vaultV2 = StreamVaultV2(address(vault));
+        assertEq(vaultV2.version(), 2);
+    }
+
+    function test_upgrade_preservesState() public {
+        // Deposit first to create meaningful state
+        usdc.mint(alice, 1_000e6);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 1_000e6);
+        vault.deposit(1_000e6, alice);
+        vm.stopPrank();
+
+        // Record state before upgrade
+        uint256 totalAssetsBefore = vault.totalAssets();
+        uint256 totalSupplyBefore = vault.totalSupply();
+        uint256 aliceSharesBefore = vault.balanceOf(alice);
+        uint256 perfFeeBefore = vault.PERFORMANCE_FEE_BPS();
+        uint256 mgmtFeeBefore = vault.managementFeeBps();
+        uint256 smoothingBefore = vault.smoothingPeriod();
+        address operatorBefore = vault.operator();
+        uint256 epochBefore = vault.currentEpochId();
+
+        // Upgrade
+        StreamVaultV2 v2Impl = new StreamVaultV2();
+        vm.prank(operator);
+        vault.upgradeToAndCall(address(v2Impl), "");
+
+        // Verify all state preserved
+        assertEq(vault.totalAssets(), totalAssetsBefore, "totalAssets changed");
+        assertEq(vault.totalSupply(), totalSupplyBefore, "totalSupply changed");
+        assertEq(vault.balanceOf(alice), aliceSharesBefore, "alice balance changed");
+        assertEq(vault.PERFORMANCE_FEE_BPS(), perfFeeBefore, "perfFee changed");
+        assertEq(vault.managementFeeBps(), mgmtFeeBefore, "mgmtFee changed");
+        assertEq(vault.smoothingPeriod(), smoothingBefore, "smoothing changed");
+        assertEq(vault.operator(), operatorBefore, "operator changed");
+        assertEq(vault.currentEpochId(), epochBefore, "epoch changed");
+    }
+
+    function test_implementation_cannotBeInitialized() public {
+        StreamVault impl = new StreamVault();
+
+        vm.expectRevert();
+        impl.initialize(
+            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V"
+        );
+    }
+
+    function test_proxy_cannotBeReinitialized() public {
+        vm.expectRevert();
+        vault.initialize(
+            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V"
+        );
     }
 }

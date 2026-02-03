@@ -1,24 +1,34 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC4626Upgradeable} from
+    "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
+import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import {IYieldSource} from "./IYieldSource.sol";
 import {IReceiver} from "./interfaces/IReceiver.sol";
 import {RiskModel} from "./libraries/RiskModel.sol";
 
 /// @title StreamVault
-/// @notice ERC-4626 vault with async (epoch-based) withdrawals, multi-connector yield sources,
-///         EMA-smoothed NAV for manipulation-resistant settlement, and continuous management fee accrual.
-///         Deposits are instant. Withdrawals go through a three-step process:
+/// @notice UUPS-upgradeable ERC-4626 vault with async (epoch-based) withdrawals, multi-connector
+///         yield sources, EMA-smoothed NAV for manipulation-resistant settlement, and continuous
+///         management fee accrual. Deposits are instant. Withdrawals go through a three-step process:
 ///         requestWithdraw → settleEpoch → claimWithdrawal.
 ///         Implements IReceiver for Chainlink CRE risk oracle integration.
-contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
+contract StreamVault is
+    Initializable,
+    ERC4626Upgradeable,
+    ReentrancyGuard,
+    PausableUpgradeable,
+    UUPSUpgradeable,
+    IReceiver
+{
     using SafeERC20 for IERC20;
     using Math for uint256;
 
@@ -59,7 +69,7 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
     address public operator;
     address public pendingOperator; // 2-step operator transfer
     address public feeRecipient;
-    uint256 public immutable PERFORMANCE_FEE_BPS; // e.g. 1000 = 10%
+    uint256 public PERFORMANCE_FEE_BPS; // e.g. 1000 = 10%, set once in initialize()
 
     uint256 public currentEpochId;
     uint256 public totalPendingShares; // shares burned but not yet settled
@@ -103,6 +113,11 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
     mapping(uint256 => mapping(address => WithdrawRequest)) public withdrawRequests;
     mapping(address => RiskModel.SourceRiskParams) public sourceRiskParams; // source address → CRE risk params
     mapping(address => bool) public isRegisteredSource; // source address → is registered
+
+    // ─── Storage Gap ─────────────────────────────────────────────────────
+
+    /// @dev Reserved storage slots for future upgrades.
+    uint256[50] private __gap;
 
     // ─── Events ─────────────────────────────────────────────────────────
 
@@ -176,9 +191,23 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
         _;
     }
 
-    // ─── Constructor ────────────────────────────────────────────────────
+    // ─── Constructor & Initializer ──────────────────────────────────────
 
-    constructor(
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// @notice Initialize the vault (called once via proxy).
+    /// @param _asset The underlying asset (e.g., USDC).
+    /// @param _operator The operator address (manages yield, settles epochs).
+    /// @param _feeRecipient The address receiving performance and management fees.
+    /// @param _performanceFeeBps Performance fee in basis points (e.g., 1000 = 10%).
+    /// @param _managementFeeBps Annual management fee in basis points (e.g., 200 = 2%).
+    /// @param _smoothingPeriod EMA smoothing period in seconds.
+    /// @param _name ERC-20 share token name.
+    /// @param _symbol ERC-20 share token symbol.
+    function initialize(
         IERC20 _asset,
         address _operator,
         address _feeRecipient,
@@ -187,7 +216,11 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
         uint256 _smoothingPeriod,
         string memory _name,
         string memory _symbol
-    ) ERC4626(_asset) ERC20(_name, _symbol) {
+    ) external initializer {
+        __ERC20_init(_name, _symbol);
+        __ERC4626_init(_asset);
+        __Pausable_init();
+
         if (_operator == address(0)) revert ZeroAddress();
         if (_performanceFeeBps > MAX_PERFORMANCE_FEE_BPS) revert FeeTooHigh();
         if (_managementFeeBps > MAX_MANAGEMENT_FEE_BPS) revert FeeTooHigh();
@@ -208,8 +241,8 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
 
         // Initialize drawdown protection with default 10% threshold
         maxDrawdownBps = DEFAULT_MAX_DRAWDOWN_BPS;
-        // Initialize HWM to match actual NAV at construction.
-        // At construction: totalSupply() = 0, so navPerShare() returns 1e18.
+        // Initialize HWM to match actual NAV at initialization.
+        // At init: totalSupply() = 0, so navPerShare() returns 1e18.
         // But after first deposit, NAV depends on asset decimals + decimalsOffset.
         // For USDC (6 dec) + offset 3: NAV ≈ 1e15, not 1e18.
         // Set to 0 so the first _checkDrawdown() call sets it to the real NAV.
@@ -864,6 +897,12 @@ contract StreamVault is ERC4626, ReentrancyGuard, Pausable, IReceiver {
         lcrFloorBps = _lcrFloorBps;
         emit LCRFloorUpdated(_lcrFloorBps);
     }
+
+    // ─── UUPS Upgrade Authorization ──────────────────────────────────────
+
+    /// @notice Authorize contract upgrades. Only the operator can upgrade.
+    /// @dev Required override for UUPSUpgradeable.
+    function _authorizeUpgrade(address) internal override onlyOperator {}
 
     // ─── CRE Integration: onReport ──────────────────────────────────────
 

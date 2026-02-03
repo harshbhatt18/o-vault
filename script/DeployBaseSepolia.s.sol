@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Script, console} from "forge-std/Script.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {StreamVault} from "../src/StreamVault.sol";
 import {AaveV3YieldSource} from "../src/AaveV3YieldSource.sol";
 import {MorphoYieldSource} from "../src/MorphoYieldSource.sol";
@@ -39,18 +40,25 @@ contract DeployBaseSepolia is Script {
 
         vm.startBroadcast(deployerKey);
 
-        // ─── 1. Deploy StreamVault ───────────────────────────────────────
-        StreamVault vault = new StreamVault(
-            IERC20(USDC),
-            deployer, // operator = deployer for testnet
-            deployer, // feeRecipient = deployer for testnet
-            1_000, // 10% performance fee
-            200, // 2% annual management fee
-            3_600, // 1 hour EMA smoothing
-            "StreamVault USDC (Base Sepolia)",
-            "svUSDC"
+        // ─── 1. Deploy StreamVault (UUPS Proxy) ───────────────────────────
+        StreamVault implementation = new StreamVault();
+        bytes memory initData = abi.encodeCall(
+            StreamVault.initialize,
+            (
+                IERC20(USDC),
+                deployer, // operator = deployer for testnet
+                deployer, // feeRecipient = deployer for testnet
+                1_000, // 10% performance fee
+                200, // 2% annual management fee
+                3_600, // 1 hour EMA smoothing
+                "StreamVault USDC (Base Sepolia)",
+                "svUSDC"
+            )
         );
-        console.log("[1/8] StreamVault deployed:", address(vault));
+        ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
+        StreamVault vault = StreamVault(address(proxy));
+        console.log("[1/8] StreamVault implementation:", address(implementation));
+        console.log("[1/8] StreamVault proxy:", address(vault));
 
         // ─── 2. Deploy AaveV3YieldSource ─────────────────────────────────
         AaveV3YieldSource aaveSource = new AaveV3YieldSource(USDC, AAVE_POOL, AAVE_AUSDC, address(vault));
