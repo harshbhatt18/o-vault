@@ -1001,6 +1001,150 @@ struct SourceRiskParams {
 }
 ```
 
+### Layer 1: Per-Source Risk Score (0-10,000)
+
+CRE reads 4 on-chain metrics per source and computes a weighted composite score.
+
+**Source:** `cre/risk-monitor-workflow/risk-model.ts` — `computeSourceRiskScore()`
+
+```
+score = (utilizationRisk × 3500 + liquidityRisk × 3000 + oracleRisk × 2000 + concentrationRisk × 1500) / 10000
+```
+
+**Sub-score formulas:**
+
+**a) Utilization Risk (weight: 35%)** — How full is the lending pool?
+
+```
+utilization < 80%    →  utilizationRisk = utilization × 500 / 8000   (gentle linear slope)
+80% – 90%            →  utilizationRisk = 3,000
+90% – 95%            →  utilizationRisk = 7,000
+> 95%                →  utilizationRisk = 10,000  (critical)
+```
+
+**b) Liquidity Risk (weight: 30%)** — How large is the vault's position vs available pool liquidity?
+
+```
+liquidityRisk = min(vaultExposure × 10000 / availableLiquidity, 10000)
+
+If availableLiquidity = 0 and vaultExposure > 0 → liquidityRisk = 10,000
+```
+
+**c) Oracle Risk (weight: 20%)** — How much has the price feed deviated?
+
+```
+oracleRisk = min(oracleDeviationBps × 20, 10000)
+
+Example: 100 bps (1%) deviation → 100 × 20 = 2,000
+         500 bps (5%) deviation → 500 × 20 = 10,000 (max)
+```
+
+**d) Concentration Risk (weight: 15%)** — What % of vault TVL sits in this one source?
+
+```
+concentrationRisk = vaultExposure × 10000 / totalVaultAssets
+```
+
+### Layer 2: Risk Score → Haircut, Stress Outflow, Concentration Limit
+
+The composite risk score maps to three output parameters through lookup tables.
+
+**Risk Score → Liquidity Haircut** (`riskScoreToHaircut`)
+
+| Risk Score | Haircut | Effect on LCR |
+|-----------|---------|---------------|
+| 0 – 1,999 | 500 bps (5%) | Count 95% of balance as liquid |
+| 2,000 – 3,999 | 1,500 bps (15%) | Count 85% of balance |
+| 4,000 – 5,999 | 3,000 bps (30%) | Count 70% of balance |
+| 6,000 – 7,999 | 5,000 bps (50%) | Count only 50% |
+| 8,000 – 10,000 | 7,500 bps (75%) | Count only 25% |
+
+**Risk Score → Stress Outflow Rate** (`riskScoreToStressOutflow`)
+
+| Risk Score | Stress Outflow | Meaning |
+|-----------|---------------|---------|
+| 0 – 1,999 | 1,000 bps (10%) | Expect 10% redemptions under stress |
+| 2,000 – 3,999 | 2,000 bps (20%) | Expect 20% redemptions |
+| 4,000 – 5,999 | 3,000 bps (30%) | Expect 30% redemptions |
+| 6,000 – 7,999 | 5,000 bps (50%) | Expect 50% redemptions |
+| 8,000 – 10,000 | 7,000 bps (70%) | Expect 70% redemptions |
+
+**Risk Score → Max Concentration Limit**
+
+| Risk Score | Max Concentration | Effect |
+|-----------|------------------|--------|
+| 0 – 4,000 | 6,000 bps (60%) | Source can hold up to 60% of vault TVL |
+| 4,001 – 7,000 | 4,000 bps (40%) | Source limited to 40% |
+| 7,001 – 10,000 | 2,000 bps (20%) | Source limited to 20% |
+
+### Layer 3: Stressed LCR → Action Decision
+
+CRE computes a global stressed LCR using a 30% redemption shock assumption:
+
+```
+stressedOutflows = pendingWithdrawals + totalAssets × 3000 / 10000
+stressedLCR = totalHQLA × 10000 / stressedOutflows
+```
+
+The stressed LCR determines which action CRE sends to the vault:
+
+| Stressed LCR | System Status | Action |
+|-------------|---------------|--------|
+| >= 15,000 (150%) | GREEN | Update params (routine) |
+| 12,000 – 14,999 (120-150%) | YELLOW | Update params (tighten) |
+| 10,000 – 11,999 (100-120%) | ORANGE | Defensive rebalance (pull capital from riskiest source) |
+| < 10,000 (< 100%) | RED | Emergency pause |
+
+### Worked Example: End-to-End
+
+**On-chain readings:**
+
+```
+Aave utilization: 8500 bps (85%)
+Aave available liquidity: 2,000,000 USDC
+Aave oracle deviation: 100 bps (1%)
+Vault Aave balance: 500,000 USDC
+Vault total assets: 1,000,000 USDC
+```
+
+**Step 1 — Sub-scores:**
+
+```
+utilizationRisk  = 3,000       (85% falls in the 80-90% bracket)
+liquidityRisk    = min(500,000 × 10,000 / 2,000,000, 10000) = 2,500
+oracleRisk       = min(100 × 20, 10000) = 2,000
+concentrationRisk = 500,000 × 10,000 / 1,000,000 = 5,000
+```
+
+**Step 2 — Composite score:**
+
+```
+score = (3,000 × 3,500 + 2,500 × 3,000 + 2,000 × 2,000 + 5,000 × 1,500) / 10,000
+      = (10,500,000 + 7,500,000 + 4,000,000 + 7,500,000) / 10,000
+      = 2,950
+```
+
+**Step 3 — Map to outputs (score = 2,950):**
+
+```
+Haircut         → 1,500 bps (15%)   [score 2,000-3,999 bracket]
+Stress outflow  → 2,000 bps (20%)   [score 2,000-3,999 bracket]
+Max concentration → 6,000 bps (60%) [score 0-4,000 bracket]
+Risk tier       → YELLOW (1)
+```
+
+**Step 4 — These parameters are sent to the vault via `onReport()` and used in:**
+
+```
+computeLCR():
+  Aave HQLA = 500,000 × (10,000 - 1,500) / 10,000 = 425,000
+  Aave stressed outflow = 500,000 × 2,000 / 10,000 = 100,000
+
+deployToYield():
+  If operator tries to put > 60% of TVL into Aave → revert ConcentrationBreached()
+  If resulting LCR < lcrFloorBps → revert LCRBreached()
+```
+
 ---
 
 ## 17. RBAC (Role-Based Access Control)
