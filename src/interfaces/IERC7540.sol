@@ -13,21 +13,12 @@ interface IERC7540Operator {
 /// @dev Extends IERC7540Operator with async redemption request lifecycle.
 interface IERC7540Redeem is IERC7540Operator {
     event RedeemRequest(
-        address indexed controller,
-        address indexed owner,
-        uint256 indexed requestId,
-        address sender,
-        uint256 assets
+        address indexed controller, address indexed owner, uint256 indexed requestId, address sender, uint256 assets
     );
 
-    function requestRedeem(uint256 shares, address controller, address owner)
-        external
-        returns (uint256 requestId);
+    function requestRedeem(uint256 shares, address controller, address owner) external returns (uint256 requestId);
 
-    function pendingRedeemRequest(uint256 requestId, address controller)
-        external
-        view
-        returns (uint256 pendingShares);
+    function pendingRedeemRequest(uint256 requestId, address controller) external view returns (uint256 pendingShares);
 
     function claimableRedeemRequest(uint256 requestId, address controller)
         external

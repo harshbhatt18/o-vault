@@ -1894,12 +1894,8 @@ contract StreamVault_ERC7540_Test is Test, ProxyDeployHelper {
         uint256 deadline = block.timestamp + 1 hours;
         uint256 nonce = vault.nonces(owner);
 
-        bytes32 structHash = keccak256(
-            abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, nonce, deadline)
-        );
-        bytes32 digest = keccak256(
-            abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash)
-        );
+        bytes32 structHash = keccak256(abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
 
         // Anyone can submit the signed approval
@@ -1915,12 +1911,8 @@ contract StreamVault_ERC7540_Test is Test, ProxyDeployHelper {
         address owner = vm.addr(ownerPrivateKey);
 
         uint256 deadline = block.timestamp - 1; // expired
-        bytes32 structHash = keccak256(
-            abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline)
-        );
-        bytes32 digest = keccak256(
-            abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash)
-        );
+        bytes32 structHash = keccak256(abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
 
         vm.expectRevert(StreamVault.SignatureExpired.selector);
@@ -1932,12 +1924,8 @@ contract StreamVault_ERC7540_Test is Test, ProxyDeployHelper {
         address owner = makeAddr("real-owner");
 
         uint256 deadline = block.timestamp + 1 hours;
-        bytes32 structHash = keccak256(
-            abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline)
-        );
-        bytes32 digest = keccak256(
-            abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash)
-        );
+        bytes32 structHash = keccak256(abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongKey, digest);
 
         vm.expectRevert(StreamVault.InvalidSigner.selector);
@@ -1949,12 +1937,8 @@ contract StreamVault_ERC7540_Test is Test, ProxyDeployHelper {
         address owner = vm.addr(ownerPrivateKey);
 
         uint256 deadline = block.timestamp + 1 hours;
-        bytes32 structHash = keccak256(
-            abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline)
-        );
-        bytes32 digest = keccak256(
-            abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash)
-        );
+        bytes32 structHash = keccak256(abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
 
         vault.setOperatorWithSig(owner, bob, true, deadline, v, r, s);

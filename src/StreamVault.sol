@@ -1143,11 +1143,7 @@ contract StreamVault is
     }
 
     /// @notice EIP-7540: Returns pending (unsettled) shares for a controller in an epoch.
-    function pendingRedeemRequest(uint256 requestId, address controller)
-        external
-        view
-        returns (uint256 pendingShares)
-    {
+    function pendingRedeemRequest(uint256 requestId, address controller) external view returns (uint256 pendingShares) {
         if (epochs[requestId].status == EpochStatus.OPEN) {
             return withdrawRequests[requestId][controller].shares;
         }
@@ -1168,8 +1164,7 @@ contract StreamVault is
 
     /// @notice ERC-165 interface detection.
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
-        return interfaceId == type(IERC7540Redeem).interfaceId
-            || interfaceId == type(IERC7540Operator).interfaceId
+        return interfaceId == type(IERC7540Redeem).interfaceId || interfaceId == type(IERC7540Operator).interfaceId
             || interfaceId == 0x01ffc9a7; // ERC-165
     }
 
