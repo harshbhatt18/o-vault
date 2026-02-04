@@ -14,6 +14,20 @@ remappings = [
 # Our overrides revert unconditionally, making the parent's post-revert lines dead code.
 ignored_warnings_from = ["lib/"]
 
+# ─── CI Fuzz Profile ───────────────────────────────────────────────────
+# Usage: FOUNDRY_PROFILE=ci forge test
+[profile.ci]
+fuzz.runs = 1024
+invariant.runs = 512
+invariant.depth = 256
+
+# ─── Deep Fuzz Profile ────────────────────────────────────────────────
+# Usage: FOUNDRY_PROFILE=deep forge test
+[profile.deep]
+fuzz.runs = 10000
+invariant.runs = 2048
+invariant.depth = 512
+
 [rpc_endpoints]
 base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 

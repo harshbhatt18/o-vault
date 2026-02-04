@@ -10,6 +10,7 @@ import {IYieldSource} from "../src/IYieldSource.sol";
 import {MockYieldSource} from "../src/MockYieldSource.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {ReentrantERC20} from "./mocks/ReentrantERC20.sol";
+import {IERC7540Redeem, IERC7540Operator} from "../src/interfaces/IERC7540.sol";
 
 /// @dev Helper for deploying StreamVault behind a UUPS proxy in tests.
 abstract contract ProxyDeployHelper {
@@ -634,8 +635,8 @@ contract StreamVault_ViewAndBatch_Test is Test, ProxyDeployHelper {
         assertEq(balances[0], 500e6);
     }
 
-    function test_getAllYieldSources() public view {
-        address[] memory sources = vault.getAllYieldSources();
+    function test_getYieldSources() public view {
+        address[] memory sources = vault.getYieldSources();
         assertEq(sources.length, 1);
         assertEq(sources[0], address(yieldSource));
     }
@@ -1226,5 +1227,1017 @@ contract StreamVault_Drawdown_Test is Test, ProxyDeployHelper {
         vault.settleEpoch();
 
         assertFalse(vault.paused(), "Vault should NOT pause when drawdown protection disabled");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transfer Restrictions
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_TransferRestrictions_Test is Test, ProxyDeployHelper {
+    MockERC20 usdc;
+    StreamVault vault;
+    MockYieldSource yieldSource;
+    address operator = makeAddr("operator");
+    address feeRecipient = makeAddr("feeRecipient");
+    address alice = makeAddr("alice");
+    address bob = makeAddr("bob");
+    address carol = makeAddr("carol");
+
+    function setUp() public {
+        usdc = new MockERC20("USDC", "USDC", 6);
+        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, 3600, "svUSDC", "svUSDC");
+        yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
+        vm.prank(operator);
+        vault.addYieldSource(IYieldSource(address(yieldSource)));
+        vm.prank(operator);
+        vault.setMaxDrawdown(0);
+    }
+
+    function _mintAndDeposit(address user, uint256 amount) internal returns (uint256) {
+        usdc.mint(user, amount);
+        vm.startPrank(user);
+        usdc.approve(address(vault), amount);
+        uint256 shares = vault.deposit(amount, user);
+        vm.stopPrank();
+        return shares;
+    }
+
+    function test_setTransfersRestricted_onlyOperator() public {
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.setTransfersRestricted(true);
+    }
+
+    function test_setTransfersRestricted_success() public {
+        vm.prank(operator);
+        vault.setTransfersRestricted(true);
+        assertTrue(vault.transfersRestricted());
+    }
+
+    function test_setTransferWhitelist_onlyOperator() public {
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.setTransferWhitelist(bob, true);
+    }
+
+    function test_setTransferWhitelist_zeroAddressReverts() public {
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.ZeroAddress.selector);
+        vault.setTransferWhitelist(address(0), true);
+    }
+
+    function test_setTransferWhitelist_success() public {
+        vm.prank(operator);
+        vault.setTransferWhitelist(bob, true);
+        assertTrue(vault.transferWhitelist(bob));
+    }
+
+    function test_batchSetTransferWhitelist_success() public {
+        address[] memory accounts = new address[](2);
+        accounts[0] = bob;
+        accounts[1] = carol;
+        bool[] memory statuses = new bool[](2);
+        statuses[0] = true;
+        statuses[1] = true;
+
+        vm.prank(operator);
+        vault.batchSetTransferWhitelist(accounts, statuses);
+
+        assertTrue(vault.transferWhitelist(bob));
+        assertTrue(vault.transferWhitelist(carol));
+    }
+
+    function test_batchSetTransferWhitelist_lengthMismatchReverts() public {
+        address[] memory accounts = new address[](2);
+        accounts[0] = bob;
+        accounts[1] = carol;
+        bool[] memory statuses = new bool[](1);
+        statuses[0] = true;
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.ArrayLengthMismatch.selector);
+        vault.batchSetTransferWhitelist(accounts, statuses);
+    }
+
+    function test_transfer_blockedWhenRestricted() public {
+        _mintAndDeposit(alice, 1_000e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        vm.prank(operator);
+        vault.setTransfersRestricted(true);
+
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.TransferRestricted.selector);
+        vault.transfer(bob, shares);
+    }
+
+    function test_transfer_allowedWhenWhitelisted() public {
+        _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(operator);
+        vault.setTransfersRestricted(true);
+        vm.prank(operator);
+        vault.setTransferWhitelist(bob, true);
+
+        uint256 amount = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.transfer(bob, amount);
+
+        assertEq(vault.balanceOf(bob), amount);
+    }
+
+    function test_transfer_unrestricted_noCheckNeeded() public {
+        _mintAndDeposit(alice, 1_000e6);
+
+        uint256 amount = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.transfer(bob, amount);
+
+        assertEq(vault.balanceOf(bob), amount);
+    }
+
+    function test_deposit_worksWhenRestricted() public {
+        vm.prank(operator);
+        vault.setTransfersRestricted(true);
+
+        // Minting (deposit) should work — from == address(0)
+        _mintAndDeposit(alice, 1_000e6);
+        assertTrue(vault.balanceOf(alice) > 0);
+    }
+
+    function test_requestWithdraw_worksWhenRestricted() public {
+        _mintAndDeposit(alice, 1_000e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        vm.prank(operator);
+        vault.setTransfersRestricted(true);
+
+        // Burning (requestWithdraw) should work — to == address(0)
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+    }
+
+    function test_transferFrom_blockedWhenRestricted() public {
+        _mintAndDeposit(alice, 1_000e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        vm.prank(operator);
+        vault.setTransfersRestricted(true);
+
+        vm.prank(alice);
+        vault.approve(bob, type(uint256).max);
+
+        vm.prank(bob);
+        vm.expectRevert(StreamVault.TransferRestricted.selector);
+        vault.transferFrom(alice, bob, shares);
+    }
+
+    function test_transfersRestricted_defaultFalse() public {
+        assertFalse(vault.transfersRestricted());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Timelock
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_Timelock_Test is Test, ProxyDeployHelper {
+    MockERC20 usdc;
+    StreamVault vault;
+    MockYieldSource yieldSource;
+    address operator = makeAddr("operator");
+    address feeRecipient = makeAddr("feeRecipient");
+    address alice = makeAddr("alice");
+
+    uint256 constant DELAY = 1 days;
+
+    function setUp() public {
+        usdc = new MockERC20("USDC", "USDC", 6);
+        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, 3600, "svUSDC", "svUSDC");
+        yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
+
+        // Add yield source before enabling timelock
+        vm.prank(operator);
+        vault.addYieldSource(IYieldSource(address(yieldSource)));
+        vm.prank(operator);
+        vault.setMaxDrawdown(0);
+    }
+
+    function test_setTimelockDelay_onlyOperator() public {
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.setTimelockDelay(DELAY);
+    }
+
+    function test_setTimelockDelay_success() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+        assertEq(vault.timelockDelay(), DELAY);
+    }
+
+    function test_setTimelockDelay_invalidBounds() public {
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.InvalidTimelockDelay.selector);
+        vault.setTimelockDelay(30 minutes); // < MIN_TIMELOCK_DELAY
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.InvalidTimelockDelay.selector);
+        vault.setTimelockDelay(8 days); // > MAX_TIMELOCK_DELAY
+    }
+
+    function test_setTimelockDelay_zeroDisables() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        // Cannot directly set delay when timelock is active
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockRequired.selector);
+        vault.setTimelockDelay(0);
+
+        // Must go through timelock to disable
+        bytes memory data = abi.encode(uint256(0));
+        bytes32 actionId = vault.TIMELOCK_SET_DELAY();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.warp(block.timestamp + DELAY);
+
+        vm.prank(operator);
+        vault.executeTimelocked(actionId, data);
+        assertEq(vault.timelockDelay(), 0);
+    }
+
+    function test_setTimelockDelay_revertsWhenActive() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        // Direct call reverts when timelock is active
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockRequired.selector);
+        vault.setTimelockDelay(2 hours);
+    }
+
+    function test_setTimelockDelay_changeViaTimelock() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        uint256 newDelay = 2 hours;
+        bytes memory data = abi.encode(newDelay);
+        bytes32 actionId = vault.TIMELOCK_SET_DELAY();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.warp(block.timestamp + DELAY);
+
+        vm.prank(operator);
+        vault.executeTimelocked(actionId, data);
+        assertEq(vault.timelockDelay(), newDelay);
+    }
+
+    function test_scheduleAction_success() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes memory data = abi.encode(uint256(100)); // 1% management fee
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        (uint256 readyAt,) = vault.timelockOps(actionId);
+        assertEq(readyAt, block.timestamp + DELAY);
+    }
+
+    function test_scheduleAction_revertsWhenTimelockDisabled() public {
+        bytes memory data = abi.encode(uint256(100));
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.InvalidTimelockDelay.selector);
+        vault.scheduleAction(actionId, data);
+    }
+
+    function test_scheduleAction_doubleScheduleReverts() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes memory data = abi.encode(uint256(100));
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockAlreadyScheduled.selector);
+        vault.scheduleAction(actionId, data);
+    }
+
+    function test_executeTimelocked_success() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes memory data = abi.encode(uint256(100));
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.warp(block.timestamp + DELAY);
+
+        vm.prank(operator);
+        vault.executeTimelocked(actionId, data);
+
+        assertEq(vault.managementFeeBps(), 100);
+    }
+
+    function test_executeTimelocked_tooEarlyReverts() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes memory data = abi.encode(uint256(100));
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.warp(block.timestamp + DELAY - 1);
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockNotReady.selector);
+        vault.executeTimelocked(actionId, data);
+    }
+
+    function test_executeTimelocked_dataMismatchReverts() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes memory data = abi.encode(uint256(100));
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.warp(block.timestamp + DELAY);
+
+        bytes memory wrongData = abi.encode(uint256(200));
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockDataMismatch.selector);
+        vault.executeTimelocked(actionId, wrongData);
+    }
+
+    function test_executeTimelocked_notScheduledReverts() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+        bytes memory data = abi.encode(uint256(100));
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockNotScheduled.selector);
+        vault.executeTimelocked(actionId, data);
+    }
+
+    function test_cancelAction_success() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes memory data = abi.encode(uint256(100));
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.prank(operator);
+        vault.cancelAction(actionId);
+
+        (uint256 readyAt,) = vault.timelockOps(actionId);
+        assertEq(readyAt, 0);
+    }
+
+    function test_cancelAction_onlyOperator() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes memory data = abi.encode(uint256(100));
+        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.cancelAction(actionId);
+    }
+
+    function test_setManagementFee_revertsWhenTimelockActive() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockRequired.selector);
+        vault.setManagementFee(100);
+    }
+
+    function test_addYieldSource_revertsWhenTimelockActive() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        MockYieldSource ys2 = new MockYieldSource(address(usdc), address(vault), 1);
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockRequired.selector);
+        vault.addYieldSource(IYieldSource(address(ys2)));
+    }
+
+    function test_setWithdrawalFee_revertsWhenTimelockActive() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.TimelockRequired.selector);
+        vault.setWithdrawalFee(50);
+    }
+
+    function test_pause_noTimelockRequired() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        // Pause should work without timelock
+        vm.prank(operator);
+        vault.pause();
+        assertTrue(vault.paused());
+    }
+
+    function test_unpause_noTimelockRequired() public {
+        vm.prank(operator);
+        vault.pause();
+
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        // Unpause should work without timelock
+        vm.prank(operator);
+        vault.unpause();
+        assertFalse(vault.paused());
+    }
+
+    function test_addYieldSource_viaTimelock() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        MockYieldSource ys2 = new MockYieldSource(address(usdc), address(vault), 1);
+        bytes memory data = abi.encode(address(ys2));
+        bytes32 actionId = vault.TIMELOCK_ADD_YIELD_SOURCE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.warp(block.timestamp + DELAY);
+
+        vm.prank(operator);
+        vault.executeTimelocked(actionId, data);
+
+        assertEq(vault.yieldSourceCount(), 2);
+    }
+
+    function test_setWithdrawalFee_viaTimelock() public {
+        vm.prank(operator);
+        vault.setTimelockDelay(DELAY);
+
+        bytes memory data = abi.encode(uint256(50));
+        bytes32 actionId = vault.TIMELOCK_SET_WITHDRAWAL_FEE();
+
+        vm.prank(operator);
+        vault.scheduleAction(actionId, data);
+
+        vm.warp(block.timestamp + DELAY);
+
+        vm.prank(operator);
+        vault.executeTimelocked(actionId, data);
+
+        assertEq(vault.withdrawalFeeBps(), 50);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EIP-7540 Compliance
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_ERC7540_Test is Test, ProxyDeployHelper {
+    MockERC20 usdc;
+    StreamVault vault;
+    MockYieldSource yieldSource;
+    address operator = makeAddr("operator");
+    address feeRecipient = makeAddr("feeRecipient");
+    address alice = makeAddr("alice");
+    address bob = makeAddr("bob");
+
+    function setUp() public {
+        usdc = new MockERC20("USDC", "USDC", 6);
+        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, 3600, "svUSDC", "svUSDC");
+        yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
+        vm.prank(operator);
+        vault.addYieldSource(IYieldSource(address(yieldSource)));
+        vm.prank(operator);
+        vault.setMaxDrawdown(0);
+    }
+
+    function _mintAndDeposit(address user, uint256 amount) internal returns (uint256) {
+        usdc.mint(user, amount);
+        vm.startPrank(user);
+        usdc.approve(address(vault), amount);
+        uint256 shares = vault.deposit(amount, user);
+        vm.stopPrank();
+        return shares;
+    }
+
+    function test_setOperator7540_success() public {
+        vm.prank(alice);
+        bool result = vault.setOperator(bob, true);
+        assertTrue(result);
+        assertTrue(vault.isOperator(alice, bob));
+    }
+
+    function test_setOperator7540_revoke() public {
+        vm.prank(alice);
+        vault.setOperator(bob, true);
+        vm.prank(alice);
+        vault.setOperator(bob, false);
+        assertFalse(vault.isOperator(alice, bob));
+    }
+
+    function test_requestRedeem_selfRequest() public {
+        uint256 shares = _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(alice);
+        uint256 requestId = vault.requestRedeem(shares, alice, alice);
+
+        assertEq(requestId, 0); // first epoch
+        assertEq(vault.pendingRedeemRequest(0, alice), shares);
+    }
+
+    function test_requestRedeem_operatorRequest() public {
+        uint256 shares = _mintAndDeposit(alice, 1_000e6);
+
+        // Alice approves bob as operator
+        vm.prank(alice);
+        vault.setOperator(bob, true);
+
+        // Bob calls requestRedeem on behalf of alice, directing to bob as controller
+        vm.prank(bob);
+        uint256 requestId = vault.requestRedeem(shares, bob, alice);
+
+        assertEq(requestId, 0);
+        // Request stored under bob (controller)
+        assertEq(vault.pendingRedeemRequest(0, bob), shares);
+        // Alice's shares were burned
+        assertEq(vault.balanceOf(alice), 0);
+    }
+
+    function test_requestRedeem_unauthorizedReverts() public {
+        _mintAndDeposit(alice, 1_000e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        // Bob is NOT approved
+        vm.prank(bob);
+        vm.expectRevert(StreamVault.ERC7540Unauthorized.selector);
+        vault.requestRedeem(shares, bob, alice);
+    }
+
+    function test_requestRedeem_zeroSharesReverts() public {
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.ZeroShares.selector);
+        vault.requestRedeem(0, alice, alice);
+    }
+
+    function test_pendingRedeemRequest_returnsCorrectAmount() public {
+        uint256 shares = _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(alice);
+        vault.requestRedeem(shares, alice, alice);
+
+        assertEq(vault.pendingRedeemRequest(0, alice), shares);
+    }
+
+    function test_pendingRedeemRequest_zeroAfterSettled() public {
+        uint256 shares = _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(alice);
+        vault.requestRedeem(shares, alice, alice);
+
+        vm.warp(block.timestamp + 3601);
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        assertEq(vault.pendingRedeemRequest(0, alice), 0);
+    }
+
+    function test_claimableRedeemRequest_zeroBeforeSettled() public {
+        uint256 shares = _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(alice);
+        vault.requestRedeem(shares, alice, alice);
+
+        assertEq(vault.claimableRedeemRequest(0, alice), 0);
+    }
+
+    function test_claimableRedeemRequest_returnsAmountAfterSettled() public {
+        uint256 shares = _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(alice);
+        vault.requestRedeem(shares, alice, alice);
+
+        vm.warp(block.timestamp + 3601);
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        assertEq(vault.claimableRedeemRequest(0, alice), shares);
+    }
+
+    function test_claimableRedeemRequest_zeroAfterClaimed() public {
+        uint256 shares = _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(alice);
+        vault.requestRedeem(shares, alice, alice);
+
+        vm.warp(block.timestamp + 3601);
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        vm.prank(alice);
+        vault.claimWithdrawal(0);
+
+        assertEq(vault.claimableRedeemRequest(0, alice), 0);
+    }
+
+    function test_supportsInterface_ERC7540Redeem() public view {
+        // IERC7540Redeem interface ID
+        assertTrue(vault.supportsInterface(type(IERC7540Redeem).interfaceId));
+    }
+
+    function test_supportsInterface_ERC7540Operator() public view {
+        assertTrue(vault.supportsInterface(type(IERC7540Operator).interfaceId));
+    }
+
+    function test_supportsInterface_ERC165() public view {
+        assertTrue(vault.supportsInterface(0x01ffc9a7));
+    }
+
+    function test_setOperatorWithSig_success() public {
+        uint256 ownerPrivateKey = 0xA11CE;
+        address owner = vm.addr(ownerPrivateKey);
+
+        _mintAndDeposit(owner, 1_000e6);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 nonce = vault.nonces(owner);
+
+        bytes32 structHash = keccak256(
+            abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, nonce, deadline)
+        );
+        bytes32 digest = keccak256(
+            abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash)
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
+
+        // Anyone can submit the signed approval
+        vm.prank(alice);
+        vault.setOperatorWithSig(owner, bob, true, deadline, v, r, s);
+
+        assertTrue(vault.isOperator(owner, bob));
+        assertEq(vault.nonces(owner), nonce + 1);
+    }
+
+    function test_setOperatorWithSig_expiredReverts() public {
+        uint256 ownerPrivateKey = 0xA11CE;
+        address owner = vm.addr(ownerPrivateKey);
+
+        uint256 deadline = block.timestamp - 1; // expired
+        bytes32 structHash = keccak256(
+            abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline)
+        );
+        bytes32 digest = keccak256(
+            abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash)
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
+
+        vm.expectRevert(StreamVault.SignatureExpired.selector);
+        vault.setOperatorWithSig(owner, bob, true, deadline, v, r, s);
+    }
+
+    function test_setOperatorWithSig_invalidSignerReverts() public {
+        uint256 wrongKey = 0xBEEF;
+        address owner = makeAddr("real-owner");
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 structHash = keccak256(
+            abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline)
+        );
+        bytes32 digest = keccak256(
+            abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash)
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongKey, digest);
+
+        vm.expectRevert(StreamVault.InvalidSigner.selector);
+        vault.setOperatorWithSig(owner, bob, true, deadline, v, r, s);
+    }
+
+    function test_setOperatorWithSig_replayReverts() public {
+        uint256 ownerPrivateKey = 0xA11CE;
+        address owner = vm.addr(ownerPrivateKey);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 structHash = keccak256(
+            abi.encode(vault.SET_OPERATOR_TYPEHASH(), owner, bob, true, 0, deadline)
+        );
+        bytes32 digest = keccak256(
+            abi.encodePacked("\x19\x01", vault.DOMAIN_SEPARATOR(), structHash)
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivateKey, digest);
+
+        vault.setOperatorWithSig(owner, bob, true, deadline, v, r, s);
+
+        // Replay with same signature fails (nonce incremented)
+        vm.expectRevert(StreamVault.InvalidSigner.selector);
+        vault.setOperatorWithSig(owner, bob, true, deadline, v, r, s);
+    }
+
+    function test_fullFlow_requestRedeem_settle_claim() public {
+        uint256 shares = _mintAndDeposit(alice, 1_000e6);
+
+        // Step 1: requestRedeem
+        vm.prank(alice);
+        uint256 requestId = vault.requestRedeem(shares, alice, alice);
+        assertEq(requestId, 0);
+        assertTrue(vault.pendingRedeemRequest(0, alice) > 0);
+
+        // Step 2: settle
+        vm.warp(block.timestamp + 3601);
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        assertEq(vault.pendingRedeemRequest(0, alice), 0);
+        assertTrue(vault.claimableRedeemRequest(0, alice) > 0);
+
+        // Step 3: claim via existing claimWithdrawal
+        uint256 balBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        vault.claimWithdrawal(0);
+
+        assertTrue(usdc.balanceOf(alice) > balBefore);
+        assertEq(vault.claimableRedeemRequest(0, alice), 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RBAC (Role-Based Access Control)
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_RBAC_Test is Test, ProxyDeployHelper {
+    MockERC20 usdc;
+    StreamVault vault;
+    MockYieldSource yieldSource;
+    address operator = makeAddr("operator");
+    address feeRecipient = makeAddr("feeRecipient");
+    address guardian = makeAddr("guardian");
+    address alice = makeAddr("alice");
+
+    function setUp() public {
+        usdc = new MockERC20("USDC", "USDC", 6);
+        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, 3600, "svUSDC", "svUSDC");
+        yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
+        vm.prank(operator);
+        vault.addYieldSource(IYieldSource(address(yieldSource)));
+    }
+
+    function test_grantRole_onlyOperator() public {
+        bytes32 role = vault.ROLE_GUARDIAN();
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.grantRole(role, guardian);
+    }
+
+    function test_grantRole_success() public {
+        bytes32 role = vault.ROLE_GUARDIAN();
+        vm.prank(operator);
+        vault.grantRole(role, guardian);
+        assertTrue(vault.hasRole(role, guardian));
+    }
+
+    function test_grantRole_zeroAddressReverts() public {
+        bytes32 role = vault.ROLE_GUARDIAN();
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.ZeroAddress.selector);
+        vault.grantRole(role, address(0));
+    }
+
+    function test_revokeRole_success() public {
+        bytes32 role = vault.ROLE_GUARDIAN();
+        vm.prank(operator);
+        vault.grantRole(role, guardian);
+        assertTrue(vault.hasRole(role, guardian));
+
+        vm.prank(operator);
+        vault.revokeRole(role, guardian);
+        assertFalse(vault.hasRole(role, guardian));
+    }
+
+    function test_hasRole_operatorImplicit() public view {
+        // Operator implicitly has all roles without explicit grant
+        assertTrue(vault.hasRole(vault.ROLE_GUARDIAN(), operator));
+    }
+
+    function test_guardian_canPause() public {
+        bytes32 role = vault.ROLE_GUARDIAN();
+        vm.prank(operator);
+        vault.grantRole(role, guardian);
+
+        vm.prank(guardian);
+        vault.pause();
+        assertTrue(vault.paused());
+    }
+
+    function test_guardian_canUnpause() public {
+        bytes32 role = vault.ROLE_GUARDIAN();
+        vm.prank(operator);
+        vault.grantRole(role, guardian);
+
+        vm.prank(guardian);
+        vault.pause();
+
+        vm.prank(guardian);
+        vault.unpause();
+        assertFalse(vault.paused());
+    }
+
+    function test_nonGuardian_cannotPause() public {
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.pause();
+    }
+
+    function test_operator_canStillPause() public {
+        // Operator can pause without explicit ROLE_GUARDIAN grant
+        vm.prank(operator);
+        vault.pause();
+        assertTrue(vault.paused());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rescuable
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_Rescuable_Test is Test, ProxyDeployHelper {
+    MockERC20 usdc;
+    MockERC20 randomToken;
+    StreamVault vault;
+    address operator = makeAddr("operator");
+    address feeRecipient = makeAddr("feeRecipient");
+    address alice = makeAddr("alice");
+
+    function setUp() public {
+        usdc = new MockERC20("USDC", "USDC", 6);
+        randomToken = new MockERC20("RND", "RND", 18);
+        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, 3600, "svUSDC", "svUSDC");
+    }
+
+    function test_rescueToken_success() public {
+        // Accidentally send random token to vault
+        randomToken.mint(address(vault), 1000e18);
+
+        vm.prank(operator);
+        vault.rescueToken(IERC20(address(randomToken)), alice, 1000e18);
+
+        assertEq(randomToken.balanceOf(alice), 1000e18);
+        assertEq(randomToken.balanceOf(address(vault)), 0);
+    }
+
+    function test_rescueToken_underlyingForbidden() public {
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.RescueUnderlyingForbidden.selector);
+        vault.rescueToken(IERC20(address(usdc)), alice, 100e6);
+    }
+
+    function test_rescueToken_onlyOperator() public {
+        randomToken.mint(address(vault), 1000e18);
+
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.rescueToken(IERC20(address(randomToken)), alice, 1000e18);
+    }
+
+    function test_rescueToken_zeroAddressReverts() public {
+        randomToken.mint(address(vault), 1000e18);
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.ZeroAddress.selector);
+        vault.rescueToken(IERC20(address(randomToken)), address(0), 1000e18);
+    }
+
+    function test_rescueToken_emitsEvent() public {
+        randomToken.mint(address(vault), 500e18);
+
+        vm.prank(operator);
+        vm.expectEmit(true, true, false, true);
+        emit StreamVault.TokenRescued(address(randomToken), alice, 500e18);
+        vault.rescueToken(IERC20(address(randomToken)), alice, 500e18);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multicall
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_Multicall_Test is Test, ProxyDeployHelper {
+    MockERC20 usdc;
+    StreamVault vault;
+    address operator = makeAddr("operator");
+    address feeRecipient = makeAddr("feeRecipient");
+
+    function setUp() public {
+        usdc = new MockERC20("USDC", "USDC", 6);
+        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, 3600, "svUSDC", "svUSDC");
+    }
+
+    function test_multicall_batchAdminCalls() public {
+        bytes[] memory calls = new bytes[](3);
+        calls[0] = abi.encodeCall(StreamVault.setDepositCap, (10_000_000e6));
+        calls[1] = abi.encodeCall(StreamVault.setLockupPeriod, (1 days));
+        calls[2] = abi.encodeCall(StreamVault.setMaxDrawdown, (1500));
+
+        vm.prank(operator);
+        vault.multicall(calls);
+
+        assertEq(vault.depositCap(), 10_000_000e6);
+        assertEq(vault.lockupPeriod(), 1 days);
+        assertEq(vault.maxDrawdownBps(), 1500);
+    }
+
+    function test_multicall_revertsIfOneCallFails() public {
+        bytes[] memory calls = new bytes[](2);
+        calls[0] = abi.encodeCall(StreamVault.setDepositCap, (10_000_000e6));
+        calls[1] = abi.encodeCall(StreamVault.setLockupPeriod, (30 days)); // exceeds MAX_LOCKUP_PERIOD
+
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.LockupPeriodTooLong.selector);
+        vault.multicall(calls);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FeeLib
+// ─────────────────────────────────────────────────────────────────────────────
+
+import {FeeLib} from "../src/libraries/FeeLib.sol";
+
+contract FeeLib_Test is Test {
+    function test_computePerformanceFee_basic() public pure {
+        // 10% fee on 1000 profit = 100
+        uint256 fee = FeeLib.computePerformanceFee(1000e6, 1000);
+        assertEq(fee, 100e6);
+    }
+
+    function test_computePerformanceFee_zeroProfit() public pure {
+        assertEq(FeeLib.computePerformanceFee(0, 1000), 0);
+    }
+
+    function test_computePerformanceFee_zeroBps() public pure {
+        assertEq(FeeLib.computePerformanceFee(1000e6, 0), 0);
+    }
+
+    function test_computeManagementFee_oneYear() public pure {
+        // 2% annual on 1M for 1 year
+        uint256 fee = FeeLib.computeManagementFee(1_000_000e6, 200, 365.25 days, 365.25 days);
+        assertEq(fee, 20_000e6);
+    }
+
+    function test_computeManagementFee_zeroElapsed() public pure {
+        assertEq(FeeLib.computeManagementFee(1_000_000e6, 200, 0, 365.25 days), 0);
+    }
+
+    function test_computeWithdrawalFee_basic() public pure {
+        // 0.5% fee on 10000 payout = 50
+        uint256 fee = FeeLib.computeWithdrawalFee(10_000e6, 50);
+        assertEq(fee, 50e6);
+    }
+
+    function test_computeWithdrawalFee_zeroPayout() public pure {
+        assertEq(FeeLib.computeWithdrawalFee(0, 50), 0);
+    }
+
+    function test_convertToSharesAtEma_zeroSupply() public pure {
+        // With zero supply, should return assets * 10^offset
+        uint256 shares = FeeLib.convertToSharesAtEma(100e6, 0, 0, 3);
+        assertEq(shares, 100e6 * 1000);
+    }
+
+    function testFuzz_computePerformanceFee_neverExceedsProfit(uint256 profit, uint256 bps) public pure {
+        profit = bound(profit, 0, 1e30);
+        bps = bound(bps, 0, 10_000);
+        uint256 fee = FeeLib.computePerformanceFee(profit, bps);
+        assertLe(fee, profit);
     }
 }

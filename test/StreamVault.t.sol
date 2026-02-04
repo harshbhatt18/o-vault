@@ -114,7 +114,7 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
         assertEq(vault.asset(), address(usdc));
         assertEq(vault.operator(), operator);
         assertEq(vault.feeRecipient(), feeRecipient);
-        assertEq(vault.PERFORMANCE_FEE_BPS(), PERF_FEE_BPS);
+        assertEq(vault.performanceFeeBps(), PERF_FEE_BPS);
         assertEq(vault.managementFeeBps(), MGMT_FEE_BPS);
         assertEq(vault.smoothingPeriod(), SMOOTHING);
         assertEq(vault.currentEpochId(), 0);
@@ -177,7 +177,7 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
     function test_boundaryValues_perfFeeMax() public {
         StreamVault v =
             _deployVault(IERC20(address(usdc)), operator, feeRecipient, 5_000, MGMT_FEE_BPS, SMOOTHING, "V", "V");
-        assertEq(v.PERFORMANCE_FEE_BPS(), 5_000);
+        assertEq(v.performanceFeeBps(), 5_000);
     }
 
     function test_boundaryValues_smoothingBounds() public {
@@ -1258,7 +1258,7 @@ contract StreamVault_Upgrade_Test is StreamVaultTestBase {
         uint256 totalAssetsBefore = vault.totalAssets();
         uint256 totalSupplyBefore = vault.totalSupply();
         uint256 aliceSharesBefore = vault.balanceOf(alice);
-        uint256 perfFeeBefore = vault.PERFORMANCE_FEE_BPS();
+        uint256 perfFeeBefore = vault.performanceFeeBps();
         uint256 mgmtFeeBefore = vault.managementFeeBps();
         uint256 smoothingBefore = vault.smoothingPeriod();
         address operatorBefore = vault.operator();
@@ -1273,7 +1273,7 @@ contract StreamVault_Upgrade_Test is StreamVaultTestBase {
         assertEq(vault.totalAssets(), totalAssetsBefore, "totalAssets changed");
         assertEq(vault.totalSupply(), totalSupplyBefore, "totalSupply changed");
         assertEq(vault.balanceOf(alice), aliceSharesBefore, "alice balance changed");
-        assertEq(vault.PERFORMANCE_FEE_BPS(), perfFeeBefore, "perfFee changed");
+        assertEq(vault.performanceFeeBps(), perfFeeBefore, "perfFee changed");
         assertEq(vault.managementFeeBps(), mgmtFeeBefore, "mgmtFee changed");
         assertEq(vault.smoothingPeriod(), smoothingBefore, "smoothing changed");
         assertEq(vault.operator(), operatorBefore, "operator changed");
@@ -1290,5 +1290,287 @@ contract StreamVault_Upgrade_Test is StreamVaultTestBase {
     function test_proxy_cannotBeReinitialized() public {
         vm.expectRevert();
         vault.initialize(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. Deposit Cap
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_DepositCap_Test is StreamVaultTestBase {
+    function test_setDepositCap_onlyOperator() public {
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.setDepositCap(1_000e6);
+    }
+
+    function test_setDepositCap_success() public {
+        vm.prank(operator);
+        vault.setDepositCap(5_000e6);
+        assertEq(vault.depositCap(), 5_000e6);
+    }
+
+    function test_setDepositCap_zeroMeansUnlimited() public {
+        vm.prank(operator);
+        vault.setDepositCap(0);
+        assertEq(vault.maxDeposit(alice), type(uint256).max);
+    }
+
+    function test_maxDeposit_respectsCap() public {
+        vm.prank(operator);
+        vault.setDepositCap(2_000e6);
+
+        _mintAndDeposit(alice, 1_000e6);
+
+        uint256 remaining = vault.maxDeposit(alice);
+        assertApproxEqAbs(remaining, 1_000e6, 1);
+    }
+
+    function test_maxMint_respectsCap() public {
+        vm.prank(operator);
+        vault.setDepositCap(2_000e6);
+
+        _mintAndDeposit(alice, 1_000e6);
+
+        uint256 maxMintShares = vault.maxMint(alice);
+        assertTrue(maxMintShares > 0);
+        assertTrue(maxMintShares < type(uint256).max);
+    }
+
+    function test_maxDeposit_returnsZeroWhenCapReached() public {
+        vm.prank(operator);
+        vault.setDepositCap(1_000e6);
+
+        _mintAndDeposit(alice, 1_000e6);
+
+        assertEq(vault.maxDeposit(alice), 0);
+        assertEq(vault.maxMint(alice), 0);
+    }
+
+    function test_deposit_rejectsOverCap() public {
+        vm.prank(operator);
+        vault.setDepositCap(500e6);
+
+        usdc.mint(alice, 1_000e6);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 1_000e6);
+        vm.expectRevert();
+        vault.deposit(1_000e6, alice);
+        vm.stopPrank();
+    }
+
+    function test_depositCap_defaultUnlimited() public {
+        assertEq(vault.depositCap(), 0);
+        assertEq(vault.maxDeposit(alice), type(uint256).max);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. Withdrawal Fee
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_WithdrawalFee_Test is StreamVaultTestBase {
+    function test_setWithdrawalFee_onlyOperator() public {
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.setWithdrawalFee(50);
+    }
+
+    function test_setWithdrawalFee_success() public {
+        vm.prank(operator);
+        vault.setWithdrawalFee(50);
+        assertEq(vault.withdrawalFeeBps(), 50);
+    }
+
+    function test_setWithdrawalFee_exceedsMaxReverts() public {
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.WithdrawalFeeTooHigh.selector);
+        vault.setWithdrawalFee(101);
+    }
+
+    function test_setWithdrawalFee_maxAllowed() public {
+        vm.prank(operator);
+        vault.setWithdrawalFee(100);
+        assertEq(vault.withdrawalFeeBps(), 100);
+    }
+
+    function test_claimWithdrawal_applyFee() public {
+        _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(operator);
+        vault.setWithdrawalFee(100); // 1%
+
+        uint256 shares = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+
+        _warpForSettle();
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 recipientBefore = usdc.balanceOf(feeRecipient);
+
+        vm.prank(alice);
+        vault.claimWithdrawal(0);
+
+        uint256 aliceReceived = usdc.balanceOf(alice) - aliceBefore;
+        uint256 feeReceived = usdc.balanceOf(feeRecipient) - recipientBefore;
+
+        assertTrue(feeReceived > 0, "Fee recipient should receive fee");
+        assertApproxEqRel(feeReceived, (aliceReceived + feeReceived) / 100, 0.01e18);
+    }
+
+    function test_claimWithdrawal_zeroFeeNoDeduction() public {
+        _mintAndDeposit(alice, 1_000e6);
+
+        uint256 shares = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+
+        _warpForSettle();
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        uint256 recipientBefore = usdc.balanceOf(feeRecipient);
+
+        vm.prank(alice);
+        vault.claimWithdrawal(0);
+
+        assertEq(usdc.balanceOf(feeRecipient) - recipientBefore, 0, "No fee should be taken");
+    }
+
+    function test_batchClaimWithdrawals_applyFee() public {
+        _mintAndDeposit(alice, 1_000e6);
+
+        vm.prank(operator);
+        vault.setWithdrawalFee(50); // 0.5%
+
+        uint256 half = vault.balanceOf(alice) / 2;
+
+        vm.prank(alice);
+        vault.requestWithdraw(half);
+        _warpForSettle();
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        uint256 remaining = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.requestWithdraw(remaining);
+        _warpForSettle();
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        uint256 recipientBefore = usdc.balanceOf(feeRecipient);
+
+        uint256[] memory epochIds = new uint256[](2);
+        epochIds[0] = 0;
+        epochIds[1] = 1;
+        vm.prank(alice);
+        vault.batchClaimWithdrawals(epochIds);
+
+        assertTrue(usdc.balanceOf(feeRecipient) - recipientBefore > 0, "Fee should be collected");
+    }
+
+    function test_withdrawalFee_defaultZero() public {
+        assertEq(vault.withdrawalFeeBps(), 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. Deposit Lockup
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_Lockup_Test is StreamVaultTestBase {
+    function test_setLockupPeriod_onlyOperator() public {
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyOperator.selector);
+        vault.setLockupPeriod(1 hours);
+    }
+
+    function test_setLockupPeriod_success() public {
+        vm.prank(operator);
+        vault.setLockupPeriod(1 hours);
+        assertEq(vault.lockupPeriod(), 1 hours);
+    }
+
+    function test_setLockupPeriod_tooLongReverts() public {
+        vm.prank(operator);
+        vm.expectRevert(StreamVault.LockupPeriodTooLong.selector);
+        vault.setLockupPeriod(8 days);
+    }
+
+    function test_setLockupPeriod_zeroDisables() public {
+        vm.prank(operator);
+        vault.setLockupPeriod(1 hours);
+        vm.prank(operator);
+        vault.setLockupPeriod(0);
+        assertEq(vault.lockupPeriod(), 0);
+    }
+
+    function test_lockup_cannotWithdrawDuringLockup() public {
+        vm.prank(operator);
+        vault.setLockupPeriod(2 hours);
+
+        _mintAndDeposit(alice, 1_000e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        vm.warp(block.timestamp + 1 hours);
+
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.LockupPeriodActive.selector);
+        vault.requestWithdraw(shares);
+    }
+
+    function test_lockup_canWithdrawAfterLockup() public {
+        vm.prank(operator);
+        vault.setLockupPeriod(1 hours);
+
+        _mintAndDeposit(alice, 1_000e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        vm.warp(block.timestamp + 1 hours + 1);
+
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+    }
+
+    function test_lockup_updatedOnSecondDeposit() public {
+        vm.prank(operator);
+        vault.setLockupPeriod(1 hours);
+
+        _mintAndDeposit(alice, 500e6);
+        vm.warp(block.timestamp + 30 minutes);
+        _mintAndDeposit(alice, 500e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        vm.warp(block.timestamp + 30 minutes);
+
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.LockupPeriodActive.selector);
+        vault.requestWithdraw(shares);
+    }
+
+    function test_lockup_disabledByDefault() public {
+        assertEq(vault.lockupPeriod(), 0);
+
+        _mintAndDeposit(alice, 1_000e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+    }
+
+    function test_lockup_exactBoundary() public {
+        vm.prank(operator);
+        vault.setLockupPeriod(1 hours);
+
+        _mintAndDeposit(alice, 1_000e6);
+        uint256 shares = vault.balanceOf(alice);
+
+        vm.warp(block.timestamp + 1 hours);
+
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
     }
 }

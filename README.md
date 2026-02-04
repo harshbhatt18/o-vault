@@ -1,11 +1,11 @@
 # StreamVault
 
-**An institutional-grade, UUPS-upgradeable ERC-4626 yield aggregator with async epoch-based withdrawals, multi-strategy yield deployment, EMA-smoothed NAV, Basel III-inspired on-chain risk management, and a decentralized risk oracle powered by Chainlink CRE.**
+**An institutional-grade, UUPS-upgradeable ERC-4626 yield aggregator with async epoch-based withdrawals (EIP-7540 compliant), multi-strategy yield deployment, EMA-smoothed NAV, Basel III-inspired on-chain risk management, timelocked governance, and a decentralized risk oracle powered by Chainlink CRE.**
 
 Built with Foundry, OpenZeppelin v5 (+ Upgradeable extensions), and Chainlink CRE SDK. Deployed on Base Sepolia behind an ERC-1967 proxy with real Aave V3 and Morpho Blue integration.
 
 ```
-208 tests | 19 test contracts | 6 stateful invariant properties | UUPS Proxy | Live on Base Sepolia
+313 tests | 29 test contracts | 11 fuzz tests | 6 stateful invariants | UUPS Proxy | EIP-7540 | Live on Base Sepolia
 ```
 
 ---
@@ -113,6 +113,30 @@ ema += (spot - ema) * elapsed / smoothingPeriod
 
 **6. UUPS Upgradeable Proxy** — The vault is deployed behind an ERC-1967 proxy using the UUPS (ERC-1822) pattern. The operator can upgrade the implementation logic without changing the proxy address or losing state. Storage gaps and ERC-7201 namespaced storage ensure safe upgrades.
 
+**7. Deposit Cap / TVL Limits** — Configurable maximum total assets (`depositCap`). When set, `maxDeposit()` and `maxMint()` respect the cap. Prevents over-concentration and manages strategy capacity.
+
+**8. Withdrawal Fee** — Configurable exit fee (0-1%) charged on claim, transferred to the fee recipient as USDC. Discourages run-on-the-vault behavior.
+
+**9. Deposit Lockup Period** — Configurable lockup (0-7 days) after depositing before shares can be withdrawn. Prevents flash-deposit-before-harvest gaming.
+
+**10. Share Transfer Restrictions** — Optional whitelist mode for ERC-20 share transfers. When enabled, only whitelisted addresses can receive shares. Minting (deposits) and burning (withdrawals) are unrestricted.
+
+**11. Timelocked Governance** — Critical operator actions (fee changes, yield source management, upgrades) can be placed behind a configurable timelock (1 hour - 7 days). Emergency actions (pause/unpause) bypass the timelock. Provides depositors with change-visibility guarantees.
+
+**12. EIP-7540 Async Redeem** — The vault implements `IERC7540Redeem` for standardized async redemptions with operator delegation. `requestRedeem()` allows delegated withdrawal requests, `pendingRedeemRequest()` / `claimableRedeemRequest()` provide request lifecycle queries, and ERC-165 `supportsInterface()` advertises compliance.
+
+**13. Role-Based Access Control (RBAC)** — Lightweight role system with `ROLE_GUARDIAN` for emergency pause/unpause. The operator implicitly has all roles. Additional addresses can be granted specific roles via `grantRole()` / `revokeRole()`, enabling operational separation between day-to-day management and emergency response.
+
+**14. FeeLib** — Fee calculation logic extracted into a pure library (`FeeLib.sol`). Computes performance fees, management fees, withdrawal fees, and EMA-based share conversion. Improves auditability by isolating fee math from state-mutating vault logic.
+
+**15. Rescuable** — `rescueToken()` allows the operator to recover ERC-20 tokens accidentally sent to the vault. The underlying asset is blocked from rescue to protect depositor funds.
+
+**16. Multicall** — Inherits OpenZeppelin `Multicall` for batching multiple admin calls in a single transaction (e.g., `setDepositCap` + `setWithdrawalFee` + `setLockupPeriod` atomically).
+
+**17. EIP-712 Gasless Operator Approval** — `setOperatorWithSig()` allows relayers to submit EIP-7540 operator approvals on behalf of users without the user paying gas. Uses EIP-712 typed data hashing with per-user nonce replay protection.
+
+**18. Transient Reentrancy Guard** — Uses `ReentrancyGuardTransient` (EIP-1153 transient storage) instead of standard `ReentrancyGuard`. Reduces reentrancy check gas cost from ~2,600 to ~100 gas per call.
+
 ---
 
 ## Architecture
@@ -207,8 +231,10 @@ sequenceDiagram
 
 | Contract | Description |
 | -------- | ----------- |
-| `StreamVault.sol` | Core vault — UUPS-upgradeable ERC-4626 + IReceiver, epoch queue, EMA, fees, LCR, drawdown protection, 2-step operator transfer |
+| `StreamVault.sol` | Core vault — UUPS-upgradeable ERC-4626 + IERC7540Redeem + IReceiver + EIP712 + Multicall, epoch queue, EMA, fees, LCR, drawdown protection, timelock, transfer restrictions, deposit cap, lockup, RBAC, rescuable, 2-step operator transfer |
+| `FeeLib.sol` | Pure fee calculation library — performance, management, withdrawal fees, EMA-based share conversion |
 | `IYieldSource.sol` | Interface for yield connectors: `deposit`, `withdraw`, `balance`, `asset` |
+| `IERC7540.sol` | EIP-7540 Async Redeem + Operator interfaces |
 | `IReceiver.sol` | Chainlink CRE IReceiver interface for `onReport()` |
 | `RiskModel.sol` | Risk parameter structs and LCR computation library |
 | `AaveV3YieldSource.sol` | Aave V3 Pool adapter with utilization and liquidity views |
@@ -236,10 +262,15 @@ User ──> ERC1967Proxy (state) ──delegatecall──> Implementation (logi
 
 ### Upgrade Authorization
 
-Only the operator can authorize upgrades via `_authorizeUpgrade()`:
+Only the operator can authorize upgrades via `_authorizeUpgrade()`. When a timelock is active, upgrades must be pre-approved via the timelock schedule:
 
 ```solidity
-function _authorizeUpgrade(address) internal override onlyOperator {}
+function _authorizeUpgrade(address newImplementation) internal override onlyOperator {
+    if (timelockDelay > 0) {
+        if (newImplementation != _pendingUpgradeImpl) revert TimelockNotScheduled();
+        _pendingUpgradeImpl = address(0);
+    }
+}
 ```
 
 ### Initialization
@@ -266,7 +297,7 @@ function initialize(
 
 ### Storage Safety
 
-- **Storage gap**: `uint256[50] private __gap` reserves 50 slots for future state variables in upgrades
+- **Storage gap**: `uint256[42] private __gap` reserves 42 slots for future state variables in upgrades (8 slots used by new features)
 - **ERC-7201 namespaced storage**: OpenZeppelin v5 uses hash-based storage slots for `ERC4626Upgradeable`, `PausableUpgradeable`, and `ReentrancyGuard`, eliminating storage collision risks
 - **Re-initialization protection**: The `initializer` modifier prevents `initialize()` from being called more than once
 
@@ -276,10 +307,13 @@ function initialize(
 StreamVault is
     Initializable,              ← OZ upgradeable: init guard
     ERC4626Upgradeable,         ← OZ upgradeable: vault + ERC-20 (namespaced storage)
-    ReentrancyGuard,            ← OZ non-upgradeable: already proxy-safe in v5 (ERC-7201)
+    ReentrancyGuardTransient,   ← OZ non-upgradeable: EIP-1153 transient reentrancy guard (~100 gas)
     PausableUpgradeable,        ← OZ upgradeable: pause mechanism (namespaced storage)
     UUPSUpgradeable,            ← OZ non-upgradeable: stateless (only provides _authorizeUpgrade)
-    IReceiver                   ← Chainlink CRE callback interface
+    EIP712,                     ← OZ non-upgradeable: EIP-712 typed data hashing (gasless signatures)
+    Multicall,                  ← OZ non-upgradeable: batch multiple admin calls in one tx
+    IReceiver,                  ← Chainlink CRE callback interface
+    IERC7540Redeem              ← EIP-7540 async redemption + operator delegation
 ```
 
 ### Performing an Upgrade
@@ -632,6 +666,147 @@ vault.unpause();                        // Resume
 vault.upgradeToAndCall(address(newImpl), "");
 ```
 
+### Deposit Cap & Lockup
+
+```solidity
+// Set TVL cap (0 = unlimited)
+vault.setDepositCap(10_000_000e6);   // 10M USDC max TVL
+
+// Set lockup period (0 = disabled, max 7 days)
+vault.setLockupPeriod(1 days);       // 1-day lockup after deposit
+
+// maxDeposit() automatically respects the cap
+uint256 remaining = vault.maxDeposit(msg.sender);
+```
+
+### Withdrawal Fee
+
+```solidity
+// Set exit fee (0-100 bps, i.e. 0-1%)
+vault.setWithdrawalFee(50);          // 0.5% exit fee
+
+// Fee is deducted on claimWithdrawal(), sent to feeRecipient as USDC
+vault.claimWithdrawal(epochId);      // user receives payout - fee
+```
+
+### Transfer Restrictions
+
+```solidity
+// Enable whitelist mode for share transfers
+vault.setTransfersRestricted(true);
+
+// Whitelist specific addresses
+vault.setTransferWhitelist(treasuryAddress, true);
+
+// Batch whitelist
+address[] memory addrs = new address[](2);
+bool[] memory flags = new bool[](2);
+addrs[0] = addr1; addrs[1] = addr2;
+flags[0] = true;  flags[1] = true;
+vault.batchSetTransferWhitelist(addrs, flags);
+
+// Mints (deposits) and burns (withdrawals) are always unrestricted
+```
+
+### Timelocked Governance
+
+```solidity
+// Enable timelock (1 hour - 7 days, 0 = disabled)
+vault.setTimelockDelay(24 hours);
+
+// Direct calls to fee/source management now revert with TimelockRequired()
+// Must use schedule → wait → execute pattern:
+
+// Step 1: Schedule action
+bytes memory data = abi.encode(uint256(100)); // 1% mgmt fee
+vault.scheduleAction(vault.TIMELOCK_SET_MGMT_FEE(), data);
+
+// Step 2: Wait for timelock delay...
+
+// Step 3: Execute
+vault.executeTimelocked(vault.TIMELOCK_SET_MGMT_FEE(), data);
+
+// Cancel a pending action
+vault.cancelAction(vault.TIMELOCK_SET_MGMT_FEE());
+
+// Emergency actions (pause/unpause) bypass the timelock
+vault.pause();   // always works immediately
+```
+
+### EIP-7540 Async Redeem
+
+```solidity
+// Set an EIP-7540 operator (separate from vault admin operator)
+vault.setOperator(delegateAddress, true);
+
+// Request async redemption (self)
+uint256 requestId = vault.requestRedeem(shares, msg.sender, msg.sender);
+
+// Request on behalf of another (requires 7540 operator approval)
+uint256 requestId = vault.requestRedeem(shares, controller, owner);
+
+// Query request status (requestId = epochId)
+uint256 pending = vault.pendingRedeemRequest(requestId, controller);
+uint256 claimable = vault.claimableRedeemRequest(requestId, controller);
+
+// Claim via existing claimWithdrawal()
+vault.claimWithdrawal(requestId);
+
+// ERC-165 interface detection
+vault.supportsInterface(type(IERC7540Redeem).interfaceId); // true
+```
+
+### EIP-712 Gasless Operator Approval
+
+```solidity
+// Relayer submits owner's signed approval (owner pays no gas)
+vault.setOperatorWithSig(signer, operatorAddr, true, deadline, v, r, s);
+
+// Read the EIP-712 domain separator for off-chain construction
+bytes32 ds = vault.DOMAIN_SEPARATOR();
+
+// Nonces auto-increment per signer
+uint256 nonce = vault.nonces(signer);
+```
+
+### RBAC (Role-Based Access Control)
+
+```solidity
+// Grant guardian role (operator only)
+vault.grantRole(vault.ROLE_GUARDIAN(), guardianAddress);
+
+// Guardian can now pause/unpause
+vm.prank(guardianAddress);
+vault.pause();
+
+// Revoke role
+vault.revokeRole(vault.ROLE_GUARDIAN(), guardianAddress);
+
+// Check role
+bool isGuardian = vault.hasRole(vault.ROLE_GUARDIAN(), guardianAddress);
+// Operator implicitly has all roles
+```
+
+### Rescuable
+
+```solidity
+// Recover accidentally-sent tokens (operator only)
+vault.rescueToken(IERC20(randomToken), recipientAddress, amount);
+
+// Rescuing the underlying asset reverts with RescueUnderlyingForbidden()
+```
+
+### Multicall
+
+```solidity
+// Batch multiple admin calls in a single transaction
+bytes[] memory calls = new bytes[](3);
+calls[0] = abi.encodeCall(vault.setDepositCap, (10_000_000e6));
+calls[1] = abi.encodeCall(vault.setWithdrawalFee, (50));
+calls[2] = abi.encodeCall(vault.setLockupPeriod, (1 days));
+vault.multicall(calls);
+```
+
 ---
 
 ## Security Model
@@ -640,17 +815,19 @@ vault.upgradeToAndCall(address(newImpl), "");
 
 | Role | Capabilities |
 | ---- | ----------- |
-| **Operator** | Deploy/withdraw capital, settle epochs, harvest yield, upgrade implementation (UUPS), 2-step transfer operator, set fee recipient, CRE forwarder, management fee, smoothing period, drawdown threshold, LCR floor, yield source management, pause/unpause |
+| **Operator** | Deploy/withdraw capital, settle epochs, harvest yield, upgrade implementation (UUPS), 2-step transfer operator, set fee recipient, CRE forwarder, management fee, smoothing period, drawdown threshold, LCR floor, yield source management, pause/unpause, deposit cap, withdrawal fee, lockup period, transfer restrictions, timelock delay, schedule/execute/cancel timelocked actions, whitelist management, grant/revoke roles, rescue tokens |
+| **Guardian** (`ROLE_GUARDIAN`) | Emergency `pause()` / `unpause()` — granted via `grantRole()`. Operator implicitly has this role. |
 | **Pending Operator** | Accept operator role (2-step transfer) |
 | **CRE Forwarder** | Call `onReport()` with DON-signed risk updates, rebalances, emergency actions |
-| **User** | Deposit, request withdraw, claim from settled epochs |
+| **EIP-7540 Operator** | Call `requestRedeem()` on behalf of the controller (per-user delegation, separate from vault operator) |
+| **User** | Deposit, request withdraw, claim from settled epochs, set EIP-7540 operators, request redeem (EIP-7540) |
 
 ### Protections
 
-- **UUPS upgradeable proxy** — operator-gated `_authorizeUpgrade()`, storage gap (`__gap[50]`), `_disableInitializers()` on implementation
+- **UUPS upgradeable proxy** — operator-gated `_authorizeUpgrade()`, storage gap (`__gap[42]`), `_disableInitializers()` on implementation
 - **2-step operator transfer** — `transferOperator()` + `acceptOperator()` prevents accidental transfers to wrong addresses
 - **Custom errors** — gas-efficient custom errors (`OnlyOperator`, `SyncWithdrawDisabled`, etc.) instead of revert strings
-- **ReentrancyGuard** on all state-changing functions (proxy-safe via ERC-7201 namespaced storage)
+- **ReentrancyGuardTransient** (EIP-1153) on all state-changing functions — ~100 gas vs ~2,600 for standard ReentrancyGuard
 - **Inflation attack protection** via `_decimalsOffset() = 3` (1e3 virtual shares/assets)
 - **Rounding** always floors in favor of the vault (standard ERC-4626 convention)
 - **Zero-address checks** on initializer params, admin setters, and adapter constructors
@@ -672,6 +849,18 @@ vault.upgradeToAndCall(address(newImpl), "");
 - **Risk param bounds**: haircuts capped at 95%, validated on every CRE update
 - **Drawdown circuit breaker**: auto-pause on NAV drop > threshold from HWM
 - **Re-initialization protection**: `initializer` modifier prevents double-initialization on proxy
+- **Deposit cap**: configurable TVL limit enforced by `maxDeposit()` / `maxMint()` (0 = unlimited)
+- **Withdrawal fee cap**: exit fee capped at 1% (`MAX_WITHDRAWAL_FEE_BPS = 100`)
+- **Deposit lockup**: configurable lockup period capped at 7 days (`MAX_LOCKUP_PERIOD`)
+- **Transfer restrictions**: optional whitelist mode for share transfers; mints/burns always unrestricted
+- **Timelocked governance**: critical operator actions (fee changes, yield source management, upgrades) behind configurable timelock (1h-7d); emergency pause/unpause bypass
+- **EIP-7540 operator authorization**: per-user operator delegation for async redemptions, separate from vault admin operator
+- **RBAC**: lightweight role-based access control — `ROLE_GUARDIAN` for emergency pause/unpause; operator implicitly has all roles
+- **Rescuable**: `rescueToken()` recovers accidentally-sent ERC-20s; underlying asset rescue is blocked
+- **Multicall**: batch multiple admin calls in a single transaction
+- **EIP-712 gasless approval**: `setOperatorWithSig()` for relayed EIP-7540 operator approvals with nonce replay protection
+- **FeeLib**: fee calculations extracted into a pure library for auditability and separation of concerns
+- **Self-timelocked delay**: `setTimelockDelay()` itself requires timelock when active, preventing timelock bypass
 
 ### Emergency Pause
 
@@ -698,8 +887,10 @@ forge build
 ### Run Tests
 
 ```shell
-forge test           # 208 tests across 19 contracts
-forge test -vv       # verbose with gas
+forge test                          # 313 tests across 29 contracts
+forge test -vv                      # verbose with gas
+FOUNDRY_PROFILE=ci forge test       # 1024 fuzz runs, 512 invariant runs
+FOUNDRY_PROFILE=deep forge test     # 10000 fuzz runs, 2048 invariant runs
 ```
 
 ### CRE Workflow Simulation
@@ -718,7 +909,7 @@ slither . --filter-paths "lib/,test/" --exclude naming-convention,pragma,solc-ve
 
 ### Test Suite
 
-208 tests across 19 test contracts covering every feature:
+313 tests across 29 test contracts covering every feature:
 
 | Test Contract | Tests | Coverage |
 | ------------- | ----- | -------- |
@@ -734,13 +925,24 @@ slither . --filter-paths "lib/,test/" --exclude naming-convention,pragma,solc-ve
 | `Invariant_Test` | 6 | `totalAssets == idle + deployed - claimable`, roundtrip, inflation |
 | `Fuzz_Test` | 6 | Fuzzed deposit/withdraw roundtrip, EMA floor, fee proportionality |
 | `StatefulInvariant_Test` | 6 | Foundry invariant testing: 8 entry points, 5 actors, 128k calls, 6 properties |
-| `Reentrancy_Test` | 2 | Malicious ERC-20 callback attacks blocked by ReentrancyGuard |
+| `Reentrancy_Test` | 2 | Malicious ERC-20 callback attacks blocked by ReentrancyGuardTransient |
 | `ERC4626Compliance_Test` | 21 | Full ERC-4626 spec: convertTo\*, max\*, preview\*, fuzzed monotonicity |
 | `ViewAndBatch_Test` | 9 | View functions, batch claims, claimable exclusion |
 | `Pause_Test` | 13 | Pause/unpause, blocked operations, allowed exits, maxDeposit/maxMint return 0 |
 | `Drawdown_Test` | 13 | Circuit breaker, HWM updates, threshold config |
 | `ChainlinkOracle_Test` | 16 | Price normalization (6/8/18 dec), staleness, fuzz tests |
 | `StreamVaultCRE_Test` | 31 | Forwarder config, `onReport()` access control, all 5 actions, LCR enforcement, concentration limits, full integration cycle, backwards compatibility |
+| `DepositCap_Test` | 8 | Cap enforcement, zero=unlimited, cap reached, maxMint tracks maxDeposit |
+| `WithdrawalFee_Test` | 8 | Fee deduction, fee to recipient, zero fee no-op, batch fees, accounting identity |
+| `Lockup_Test` | 9 | Lockup enforcement, post-lockup withdrawal, reset on re-deposit, disabled by default |
+| `TransferRestrictions_Test` | 13 | Transfer blocked, whitelisted passes, mints/burns unaffected, batch whitelist, disabled by default |
+| `Timelock_Test` | 18 | Schedule/execute/cancel lifecycle, too-early reverts, data mismatch, direct calls revert when active, emergency bypass |
+| `ERC7540_Test` | 14 | Operator set/revoke, requestRedeem self & delegated, unauthorized reverts, pending/claimable queries, supportsInterface, full flow |
+| `StreamVault_RBAC_Test` | 9 | Grant/revoke roles, guardian pause/unpause, operator implicit roles, unauthorized reverts |
+| `StreamVault_Rescuable_Test` | 5 | Token rescue, underlying asset blocked, onlyOperator, zero address revert, event emission |
+| `StreamVault_Multicall_Test` | 2 | Batch admin calls, revert propagation |
+| `FeeLib_Test` | 9 | Performance/management/withdrawal fee math, EMA share conversion, fuzz: fee never exceeds profit |
+| `EIP712_Test` | 4 | setOperatorWithSig success, expired signature, invalid signer, replay protection |
 
 ### Test Design Patterns
 
@@ -767,8 +969,10 @@ o-vault/
       IYieldSource.sol           # Yield source connector interface
       IReceiver.sol              # Chainlink CRE IReceiver
       IPriceOracle.sol           # Price oracle interface
+      IERC7540.sol               # EIP-7540 Async Redeem + Operator interfaces
     libraries/
       RiskModel.sol              # Risk param structs + LCR logic
+      FeeLib.sol                 # Pure fee calculation library
   test/
     StreamVault.t.sol            # Core tests (constructor, deposit, withdraw, yield, fees, upgrade, etc.)
     StreamVaultAdvanced.t.sol    # Invariant, fuzz, reentrancy, ERC-4626 compliance, pause, drawdown
