@@ -6,7 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {StreamVault} from "../src/StreamVault.sol";
 import {AaveV3YieldSource} from "../src/AaveV3YieldSource.sol";
-import {MorphoYieldSource} from "../src/MorphoYieldSource.sol";
+import {MorphoBlueYieldSource, MarketParams} from "../src/MorphoBlueYieldSource.sol";
 
 /// @title Deploy StreamVault
 /// @notice Deployment script for StreamVault and optional yield source adapters.
@@ -29,8 +29,12 @@ import {MorphoYieldSource} from "../src/MorphoYieldSource.sol";
 ///   AAVE_POOL            - Aave V3 Pool address
 ///   AAVE_ATOKEN          - aToken address for the asset
 ///
-/// Morpho adapter (optional):
-///   MORPHO_VAULT         - MetaMorpho vault address
+/// Morpho Blue adapter — direct market supply (optional):
+///   MORPHO_BLUE              - Morpho Blue core address
+///   MORPHO_BLUE_COLLATERAL   - Collateral token for the market
+///   MORPHO_BLUE_ORACLE       - Oracle address (optional, default: address(0))
+///   MORPHO_BLUE_IRM          - IRM address (optional, default: address(0))
+///   MORPHO_BLUE_LLTV         - LLTV value (optional, default: 0)
 contract DeployStreamVault is Script {
     function run() external {
         // ─── Load Configuration ─────────────────────────────────────────────
@@ -69,7 +73,16 @@ contract DeployStreamVault is Script {
         // Deploy UUPS proxy with initialize calldata
         bytes memory initData = abi.encodeCall(
             StreamVault.initialize,
-            (IERC20(asset), operatorAddr, feeRecipient, performanceFeeBps, managementFeeBps, smoothingPeriod, vaultName, vaultSymbol)
+            (
+                IERC20(asset),
+                operatorAddr,
+                feeRecipient,
+                performanceFeeBps,
+                managementFeeBps,
+                smoothingPeriod,
+                vaultName,
+                vaultSymbol
+            )
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
         StreamVault vault = StreamVault(address(proxy));
@@ -89,16 +102,9 @@ contract DeployStreamVault is Script {
             // Note: Operator must call vault.addYieldSource(aaveAdapter) after deployment
         }
 
-        // ─── Deploy Morpho Adapter (optional) ───────────────────────────────
+        // ─── Deploy Morpho Blue Adapter (optional) ─────────────────────────
 
-        address morphoVault = vm.envOr("MORPHO_VAULT", address(0));
-        if (morphoVault != address(0)) {
-            MorphoYieldSource morphoAdapter = new MorphoYieldSource(morphoVault, address(vault));
-
-            console.log("MorphoYieldSource deployed at:", address(morphoAdapter));
-
-            // Note: Operator must call vault.addYieldSource(morphoAdapter) after deployment
-        }
+        _deployMorphoBlue(asset, address(vault));
 
         vm.stopBroadcast();
 
@@ -111,6 +117,24 @@ contract DeployStreamVault is Script {
         console.log("3. Test deposit/withdraw flow on testnet before mainnet");
         console.log("4. Set up monitoring for vault events");
         console.log("5. Document operator runbook (settlement cadence, harvest timing)");
+    }
+
+    function _deployMorphoBlue(address asset, address vault) internal {
+        address morphoBlue = vm.envOr("MORPHO_BLUE", address(0));
+        if (morphoBlue == address(0)) return;
+
+        MarketParams memory marketParams = MarketParams({
+            loanToken: asset,
+            collateralToken: vm.envAddress("MORPHO_BLUE_COLLATERAL"),
+            oracle: vm.envOr("MORPHO_BLUE_ORACLE", address(0)),
+            irm: vm.envOr("MORPHO_BLUE_IRM", address(0)),
+            lltv: vm.envOr("MORPHO_BLUE_LLTV", uint256(0))
+        });
+
+        MorphoBlueYieldSource morphoBlueAdapter = new MorphoBlueYieldSource(morphoBlue, marketParams, vault);
+        console.log("MorphoBlueYieldSource deployed at:", address(morphoBlueAdapter));
+
+        // Note: Operator must call vault.addYieldSource(morphoBlueAdapter) after deployment
     }
 }
 
@@ -131,16 +155,7 @@ contract DeploySepolia is Script {
         StreamVault implementation = new StreamVault();
         bytes memory initData = abi.encodeCall(
             StreamVault.initialize,
-            (
-                IERC20(usdc),
-                operatorAddr,
-                operatorAddr,
-                1_000,
-                200,
-                3_600,
-                "StreamVault USDC (Sepolia)",
-                "svUSDC"
-            )
+            (IERC20(usdc), operatorAddr, operatorAddr, 1_000, 200, 3_600, "StreamVault USDC (Sepolia)", "svUSDC")
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
         StreamVault vault = StreamVault(address(proxy));

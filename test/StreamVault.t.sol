@@ -39,7 +39,14 @@ abstract contract StreamVaultTestBase is Test {
         usdc = new MockERC20("USD Coin", "USDC", 6);
 
         vault = _deployVault(
-            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "StreamVault USDC", "svUSDC"
+            IERC20(address(usdc)),
+            operator,
+            feeRecipient,
+            PERF_FEE_BPS,
+            MGMT_FEE_BPS,
+            SMOOTHING,
+            "StreamVault USDC",
+            "svUSDC"
         );
 
         // Deploy mock yield source wired to vault (proxy address)
@@ -690,8 +697,9 @@ contract StreamVault_EMA_Test is StreamVaultTestBase {
 
     function test_ema_firstDepositSnaps() public {
         // Deploy a fresh vault
-        StreamVault v2 =
-            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V2", "V2");
+        StreamVault v2 = _deployVault(
+            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V2", "V2"
+        );
         assertEq(v2.emaTotalAssets(), 1000); // virtual offset
 
         usdc.mint(alice, 5_000e6);
@@ -1276,15 +1284,11 @@ contract StreamVault_Upgrade_Test is StreamVaultTestBase {
         StreamVault impl = new StreamVault();
 
         vm.expectRevert();
-        impl.initialize(
-            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V"
-        );
+        impl.initialize(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V");
     }
 
     function test_proxy_cannotBeReinitialized() public {
         vm.expectRevert();
-        vault.initialize(
-            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V"
-        );
+        vault.initialize(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V");
     }
 }

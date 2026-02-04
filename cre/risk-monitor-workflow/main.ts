@@ -37,7 +37,7 @@ export type Config = {
   vaultAddress: string;
   /** AaveV3YieldSource adapter address */
   aaveSourceAddress: string;
-  /** MorphoYieldSource adapter address */
+  /** MorphoBlueYieldSource adapter address */
   morphoSourceAddress: string;
   /** Gas limit for onReport() transaction */
   gasLimit: string;

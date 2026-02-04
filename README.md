@@ -2,7 +2,7 @@
 
 **An institutional-grade, UUPS-upgradeable ERC-4626 yield aggregator with async epoch-based withdrawals, multi-strategy yield deployment, EMA-smoothed NAV, Basel III-inspired on-chain risk management, and a decentralized risk oracle powered by Chainlink CRE.**
 
-Built with Foundry, OpenZeppelin v5 (+ Upgradeable extensions), and Chainlink CRE SDK. Deployed on Base Sepolia behind an ERC-1967 proxy with real Aave V3 integration.
+Built with Foundry, OpenZeppelin v5 (+ Upgradeable extensions), and Chainlink CRE SDK. Deployed on Base Sepolia behind an ERC-1967 proxy with real Aave V3 and Morpho Blue integration.
 
 ```
 208 tests | 19 test contracts | 6 stateful invariant properties | UUPS Proxy | Live on Base Sepolia
@@ -69,9 +69,9 @@ User deposits USDC --> Vault (idle balance)
                          |
               +----------+----------+
               v          v          v
-           Aave V3    Morpho    Source N
-          (lending)  (optimized  (any
-                      lending)   IYieldSource)
+          Aave V3  Morpho Blue  Source N
+         (lending)   (direct     (any
+                     market)    IYieldSource)
               |          |          |
               +----------+----------+
                          |
@@ -90,7 +90,7 @@ User deposits USDC --> Vault (idle balance)
 Ships with three adapters:
 
 - **Aave V3** — supplies underlying to the Aave Pool, tracks balance via rebasing aToken
-- **MetaMorpho** — deposits into ERC-4626 MetaMorpho vaults, tracks balance via share-to-asset conversion
+- **Morpho Blue** — supplies directly to a Morpho Blue lending market, tracks balance via supply share conversion with virtual share accounting
 - **MockYieldSource** — configurable-rate simulator for testing
 
 ### What Makes This Different
@@ -212,7 +212,7 @@ sequenceDiagram
 | `IReceiver.sol` | Chainlink CRE IReceiver interface for `onReport()` |
 | `RiskModel.sol` | Risk parameter structs and LCR computation library |
 | `AaveV3YieldSource.sol` | Aave V3 Pool adapter with utilization and liquidity views |
-| `MorphoYieldSource.sol` | MetaMorpho ERC-4626 vault adapter with market utilization views |
+| `MorphoBlueYieldSource.sol` | Morpho Blue direct market supply adapter with virtual share accounting, utilization and liquidity views |
 | `ChainlinkOracle.sol` | Chainlink price feed adapter with decimal normalization |
 
 ---
@@ -373,17 +373,16 @@ cre/
 
 ## Live Testnet Deployment (Base Sepolia)
 
-The full StreamVault system is deployed on **Base Sepolia** (chain ID 84532) behind a **UUPS proxy (ERC-1967)** with real Aave V3 integration and a mock ERC-4626 vault as a Morpho stand-in (Morpho has no Base Sepolia deployment).
+The full StreamVault system is deployed on **Base Sepolia** (chain ID 84532) behind a **UUPS proxy (ERC-1967)** with real Aave V3 and Morpho Blue integration.
 
 ### Deployed Contracts
 
 | Contract | Address | BaseScan |
 | -------- | ------- | -------- |
-| **StreamVault Proxy** | `0xfef5a1dF7BE97614d0a744ddE2333A8CD7d8Bf16` | [View](https://sepolia.basescan.org/address/0xfef5a1dF7BE97614d0a744ddE2333A8CD7d8Bf16) |
-| **StreamVault Implementation** | `0x75d7BEE9Ee294BBeDfE1e307b69F41051838F32f` | [View](https://sepolia.basescan.org/address/0x75d7BEE9Ee294BBeDfE1e307b69F41051838F32f) |
-| **AaveV3YieldSource** | `0xA482Cc7eA5C91AF4c219E0Fb898aFbe3Ad66Ba99` | [View](https://sepolia.basescan.org/address/0xA482Cc7eA5C91AF4c219E0Fb898aFbe3Ad66Ba99) |
-| **MockERC4626Vault** (Morpho stand-in) | `0x46E3F1C4729444e9b105b293E2F332FA6f692415` | [View](https://sepolia.basescan.org/address/0x46E3F1C4729444e9b105b293E2F332FA6f692415) |
-| **MorphoYieldSource** | `0x343bF9575518b91D398fb1d776804004Aa82aA7e` | [View](https://sepolia.basescan.org/address/0x343bF9575518b91D398fb1d776804004Aa82aA7e) |
+| **StreamVault Proxy** | `0xfe5FE166E70a2772B6d6cA98A9432925088620A5` | [View](https://sepolia.basescan.org/address/0xfe5FE166E70a2772B6d6cA98A9432925088620A5) |
+| **StreamVault Implementation** | `0x8b7FC39315d47177486b548ECdeface12674dFc9` | [View](https://sepolia.basescan.org/address/0x8b7FC39315d47177486b548ECdeface12674dFc9) |
+| **AaveV3YieldSource** | `0x0724eafD693c2c7F07fafa321b1bF75D2572f190` | [View](https://sepolia.basescan.org/address/0x0724eafD693c2c7F07fafa321b1bF75D2572f190) |
+| **MorphoBlueYieldSource** | `0x9197eC25246b992797C4DADc479874Cb0c473AeD` | [View](https://sepolia.basescan.org/address/0x9197eC25246b992797C4DADc479874Cb0c473AeD) |
 
 ### External Contracts Used
 
@@ -392,21 +391,22 @@ The full StreamVault system is deployed on **Base Sepolia** (chain ID 84532) beh
 | USDC (Base Sepolia) | `0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f` |
 | Aave V3 Pool | `0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27` |
 | Aave aUSDC | `0x10F1A9D11CDf50041f3f8cB7191CBE2f31750ACC` |
+| Morpho Blue Core | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` |
 | CRE Forwarder | `0x82300bd7c3958625581cc2f77bc6464dcecdf3e5` |
 
 ### Deployment Transactions (UUPS Proxy)
 
 | Step | Transaction |
 | ---- | ----------- |
-| Deploy StreamVault Implementation | [`0xd7df2a70...`](https://sepolia.basescan.org/tx/0xd7df2a708e6a1fc6e99a4158dab0b6a78ade89287529f2b033ab4c4dec79ccfe) |
-| Deploy ERC1967Proxy (+ initialize) | [`0x1b4c5add...`](https://sepolia.basescan.org/tx/0x1b4c5add32ebf0c0920962b934d909f5f46d9d313cd3f4f4ca6b7e92e642b9db) |
-| Deploy AaveV3YieldSource | [`0x22a0a236...`](https://sepolia.basescan.org/tx/0x22a0a236562f7482c693abc0336e6a09816961cd448a9af37f8e34f4674824a3) |
-| Deploy MockERC4626Vault | [`0x6fe60650...`](https://sepolia.basescan.org/tx/0x6fe606505a3bf7fb58b9fd71f0c913247eff2e6cb1b3bb95d82af02c9bdbf188) |
-| Deploy MorphoYieldSource | [`0xdf7b03ae...`](https://sepolia.basescan.org/tx/0xdf7b03aeb4ca1a67e858b29a43111e09750c4898d125202fb1cad1e777cdc0c6) |
-| Register Aave source | [`0xcc45930a...`](https://sepolia.basescan.org/tx/0xcc45930a5d8472a412ddc65d0b434019643254c7982d6311ebc49fcea2a6889a) |
-| Register Morpho source | [`0xff0a516e...`](https://sepolia.basescan.org/tx/0xff0a516eb5a390aa75bfcf44f1779e69652f8083fa02cb0207cb679467c10833) |
-| Set CRE Forwarder | [`0x8ddafdd5...`](https://sepolia.basescan.org/tx/0x8ddafdd57ba9595a0f8443e23ec9268592e92e81f0ff7a88fd94ca5ea96ace9c) |
-| Set LCR Floor (120%) | [`0x12d91170...`](https://sepolia.basescan.org/tx/0x12d911709a9f1f723e809ebf7f295c2af1116585b34665a0379cb03527c838ef) |
+| Deploy StreamVault Implementation | [`0xb73490bb...`](https://sepolia.basescan.org/tx/0xb73490bbf8d8bf53bf4bc23aeccb2445f0eb1527340ac6a5b88dc7d557c92bf8) |
+| Deploy ERC1967Proxy (+ initialize) | [`0x051e111f...`](https://sepolia.basescan.org/tx/0x051e111f9fa05a0d2c1c0f69495e742a0d51cc42f184f88d82bc41eef22cf66a) |
+| Deploy AaveV3YieldSource | [`0xefb92f2a...`](https://sepolia.basescan.org/tx/0xefb92f2aafd674703a20b3ddeda066c91c08bb5390a097e6fb5559b46a721705) |
+| Create Morpho Blue Market | [`0x6dc40b89...`](https://sepolia.basescan.org/tx/0x6dc40b89c692930ec3effcb933929a00df6aef5f1da76929549f638dbdb8cc69) |
+| Deploy MorphoBlueYieldSource | [`0x81179d74...`](https://sepolia.basescan.org/tx/0x81179d74e684730ee1f73939b9e374fa75ae32acdecd78644f65a79847727f85) |
+| Register Aave source | [`0x775321b5...`](https://sepolia.basescan.org/tx/0x775321b577abd5500aa5a2db980a15a66eb2a29a0f660c2b8c187f7123e7bf4b) |
+| Register Morpho Blue source | [`0xd02f2e14...`](https://sepolia.basescan.org/tx/0xd02f2e14df34d4128c96fdd920b4422883d8599432f48bb5f13583325415622c) |
+| Set CRE Forwarder | [`0x893807b8...`](https://sepolia.basescan.org/tx/0x893807b80e9195495378bbffbef054f16f1fa7e7e28aedc76e6d9ad66ddaed82) |
+| Set LCR Floor (120%) | [`0x5dfdb0ad...`](https://sepolia.basescan.org/tx/0x5dfdb0ad8cae6b686ce63d7db8b7eb7c62fa86d7c4c6ea2f233dabd63492de5f) |
 
 ### End-to-End Demo Transactions
 
@@ -429,7 +429,7 @@ After deployment, the following features were individually verified on the live 
 | Feature | Status | Verification |
 | ------- | ------ | ----------- |
 | ERC-4626 deposit/mint | Verified | 1000 USDC deposited, shares minted at correct NAV |
-| Multi-source yield deployment | Verified | Capital deployed to Aave (real yield accruing) and Morpho mock |
+| Multi-source yield deployment | Verified | Capital deployed to Aave V3 (real yield accruing) and Morpho Blue (direct market supply) |
 | EMA-smoothed NAV | Verified | EMA converging correctly after time warp |
 | Continuous management fee | Verified | Fee shares minting proportional to time elapsed |
 | Per-source HWM performance fee | Verified | `harvestYield()` succeeded, HWM set to real NAV (~1e15 for USDC) |
@@ -445,7 +445,7 @@ After deployment, the following features were individually verified on the live 
 
 ## CRE Simulation Results
 
-The CRE risk monitor workflow was simulated using `cre workflow simulate` against the **live UUPS proxy deployment** on Base Sepolia. The simulation reads real on-chain state through the proxy, runs the full risk model, generates a DON-signed report, and simulates the write transaction.
+The CRE risk monitor workflow was simulated using `cre workflow simulate` against the **live UUPS proxy deployment** on Base Sepolia. The simulation reads real on-chain state from both **Aave V3** and **Morpho Blue** through the proxy, runs the full risk model, generates a DON-signed report, and simulates the write transaction.
 
 ### Simulation Output
 
@@ -453,18 +453,18 @@ The CRE risk monitor workflow was simulated using `cre workflow simulate` agains
 [SIMULATION] Running trigger trigger=cron-trigger@1.0.0
 
 [USER LOG] CRE Risk Monitor: Starting health check
-[USER LOG]   Execution time: 2026-02-03T15:10:58.401Z
+[USER LOG]   Execution time: 2026-02-04T04:39:15.072Z
 
 [USER LOG] [Step 1] Reading protocol health metrics...
   -- 10 on-chain reads via EVMClient (DON consensus) --
-  Aave utilization: 3312 bps        (33.12% -- real Base Sepolia Aave pool)
-  Aave liquidity:   5,000,000,177   (5000 USDC available in pool)
-  Morpho utilization: 0 bps         (mock vault, no utilization)
-  Morpho liquidity:   3,000,000,000 (3000 USDC in mock vault)
-  Vault TVL:          10,000,000,177 (10,000 USDC total assets)
-  Aave balance:       5,000,000,177 (5000 USDC deployed + yield accrued)
-  Morpho balance:     3,000,000,000 (3000 USDC deployed)
-  Idle balance:       2,000,000,000 (2000 USDC in vault)
+  Aave utilization: 3296 bps        (32.96% -- real Base Sepolia Aave V3 pool)
+  Aave liquidity:   500,000,026     (500 USDC available + yield accrued)
+  Morpho utilization: 0 bps         (Morpho Blue market, no borrowers)
+  Morpho liquidity:   300,000,000   (300 USDC in Morpho Blue direct market)
+  Vault TVL:          1,000,000,026 (1,000 USDC total assets)
+  Aave balance:       500,000,026   (500 USDC deployed + yield accrued)
+  Morpho balance:     300,000,000   (300 USDC in Morpho Blue market)
+  Idle balance:       200,000,000   (200 USDC in vault)
   Pending withdrawals: 0
 
 [USER LOG] [Step 2] Computing risk model...
@@ -483,7 +483,7 @@ The CRE risk monitor workflow was simulated using `cre workflow simulate` agains
   -- consensus@1.0.0-alpha COMPLETED --
 
 [USER LOG] [Step 4] Submitting report to vault via KeystoneForwarder...
-  Target: 0xfef5a1dF7BE97614d0a744ddE2333A8CD7d8Bf16 (proxy)
+  Target: 0xfe5FE166E70a2772B6d6cA98A9432925088620A5 (proxy)
   -- evm write COMPLETED --
 
 [USER LOG] [Complete] Transaction successful!
@@ -494,15 +494,17 @@ WorkflowExecutionFinished - Status: SUCCESS
 
 ### What the Simulation Proves
 
-1. **UUPS proxy is transparent to CRE** — The workflow reads and writes through the proxy address identically to a non-proxied contract. All 10 on-chain reads (vault state, Aave utilization, source balances) returned correct data via `delegatecall`.
+1. **UUPS proxy is transparent to CRE** — The workflow reads and writes through the proxy address identically to a non-proxied contract. All 10 on-chain reads (vault state, Aave utilization, Morpho Blue market state, source balances) returned correct data via `delegatecall`.
 
-2. **Risk model produces correct outputs** — Aave at 33% utilization and 50% concentration scored 3822/10000 (moderate). Morpho at 30% concentration scored 3449/10000. The stressed LCR of 293% is well above the 120% floor, correctly yielding GREEN status.
+2. **Morpho Blue direct market integration works** — The `MorphoBlueYieldSource` adapter correctly reports balance (300 USDC via virtual share conversion), utilization (0 bps — no borrowers), and available liquidity through the CRE `getMarketUtilization()` and `getAvailableLiquidity()` view functions. No mocks involved.
 
-3. **Report generation works** — The DON consensus and ECDSA signing completed successfully, producing a valid report payload.
+3. **Risk model produces correct outputs** — Aave at 33% utilization and 50% concentration scored 3822/10000 (moderate). Morpho Blue at 30% concentration scored 3449/10000. The stressed LCR of 293% is well above the 120% floor, correctly yielding GREEN status.
 
-4. **Write path works through proxy** — The simulated `writeReport()` to the proxy address completed, demonstrating the full Forwarder -> Proxy -> `onReport()` delegatecall path.
+4. **Report generation works** — The DON consensus and ECDSA signing completed successfully, producing a valid report payload.
 
-5. **Deterministic execution** — The workflow compiled to WASM (0.61 MB), ran identically across the simulated node, and produced consistent results.
+5. **Write path works through proxy** — The simulated `writeReport()` to the proxy address completed, demonstrating the full Forwarder -> Proxy -> `onReport()` delegatecall path.
+
+6. **Deterministic execution** — The workflow compiled to WASM (0.61 MB), ran identically across the simulated node, and produced consistent results.
 
 ### Deployment Status
 
@@ -758,7 +760,7 @@ o-vault/
   src/
     StreamVault.sol              # Core vault (UUPS + ERC-4626 + IReceiver + LCR)
     AaveV3YieldSource.sol        # Aave V3 Pool adapter
-    MorphoYieldSource.sol        # MetaMorpho ERC-4626 adapter
+    MorphoBlueYieldSource.sol    # Morpho Blue direct market adapter
     ChainlinkOracle.sol          # Chainlink price feed adapter
     MockYieldSource.sol          # Configurable-rate mock for testing
     interfaces/
@@ -778,8 +780,6 @@ o-vault/
     Deploy.s.sol                 # Generic UUPS proxy deployment
     DeployBaseSepolia.s.sol      # Base Sepolia proxy deployment
     DemoE2E.s.sol                # End-to-end demo script
-    mocks/
-      MockERC4626Vault.sol       # Morpho stand-in for testnet
   cre/
     project.yaml                 # CRE project config
     risk-monitor-workflow/

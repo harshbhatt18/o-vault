@@ -38,7 +38,16 @@ contract StreamVaultCRE_Test is Test {
         StreamVault implementation = new StreamVault();
         bytes memory initData = abi.encodeCall(
             StreamVault.initialize,
-            (IERC20(address(usdc)), operator, feeRecipient, PERFORMANCE_FEE_BPS, MANAGEMENT_FEE_BPS, SMOOTHING_PERIOD, "StreamVault USDC", "svUSDC")
+            (
+                IERC20(address(usdc)),
+                operator,
+                feeRecipient,
+                PERFORMANCE_FEE_BPS,
+                MANAGEMENT_FEE_BPS,
+                SMOOTHING_PERIOD,
+                "StreamVault USDC",
+                "svUSDC"
+            )
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
         vault = StreamVault(address(proxy));
