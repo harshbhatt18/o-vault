@@ -26,3 +26,5 @@ cre/**/tmp.*
 
 # OS files
 .DS_Store
+
+.certora_internal

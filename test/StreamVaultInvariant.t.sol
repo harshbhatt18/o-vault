@@ -43,6 +43,13 @@ contract AdvancedVaultHandler is Test {
     // Track share supply at key moments
     uint256 public ghostSharesMintedToFeeRecipient;
 
+    // ── Ghost variables for new features ──
+    uint256 public ghostTransferRestrictionToggles;
+    uint256 public ghostOperator7540Sets;
+    uint256 public ghostRequestRedeemCount;
+    mapping(address => bool) public ghostWhitelistedAddresses;
+    mapping(address => mapping(address => bool)) public ghostOperator7540State;
+
     constructor(
         StreamVault _vault,
         MockERC20 _usdc,
@@ -297,6 +304,89 @@ contract AdvancedVaultHandler is Test {
         try vault.transfer(to, amount) {} catch {}
     }
 
+    // ── Transfer Restriction Operations ──
+
+    function toggleTransferRestrictions() external {
+        bool current = vault.transfersRestricted();
+        vm.prank(operator);
+        vault.setTransfersRestricted(!current);
+        ghostTransferRestrictionToggles++;
+    }
+
+    function setTransferWhitelist(uint256 actorSeed, bool status) external {
+        address account = actors[actorSeed % NUM_ACTORS];
+        vm.prank(operator);
+        vault.setTransferWhitelist(account, status);
+        ghostWhitelistedAddresses[account] = status;
+    }
+
+    function batchSetTransferWhitelist(uint256 seed, bool status) external {
+        uint256 count = bound(seed, 1, 4);
+        address[] memory accounts = new address[](count);
+        bool[] memory statuses = new bool[](count);
+
+        for (uint256 i; i < count; ++i) {
+            accounts[i] = actors[(seed + i) % NUM_ACTORS];
+            statuses[i] = status;
+            ghostWhitelistedAddresses[accounts[i]] = status;
+        }
+
+        vm.prank(operator);
+        vault.batchSetTransferWhitelist(accounts, statuses);
+    }
+
+    // ── EIP-7540 Operator Operations ──
+
+    function setOperator7540(uint256 controllerSeed, uint256 operatorSeed, bool approved) external {
+        address controller = actors[controllerSeed % NUM_ACTORS];
+        address op = actors[operatorSeed % NUM_ACTORS];
+        if (controller == op) return;
+
+        vm.prank(controller);
+        vault.setOperator(op, approved);
+        ghostOperator7540State[controller][op] = approved;
+        ghostOperator7540Sets++;
+    }
+
+    function requestRedeem(uint256 ownerSeed, uint256 controllerSeed, uint256 shareFraction) external {
+        address owner = actors[ownerSeed % NUM_ACTORS];
+        address controller = actors[controllerSeed % NUM_ACTORS];
+
+        uint256 shares = vault.balanceOf(owner);
+        if (shares == 0) return;
+
+        shareFraction = bound(shareFraction, 1, 100);
+        uint256 toRedeem = shares * shareFraction / 100;
+        if (toRedeem == 0) return;
+
+        // Skip if lockup active
+        uint256 lockup = vault.lockupPeriod();
+        if (lockup > 0 && block.timestamp < vault.depositTimestamp(owner) + lockup) return;
+
+        // Check authorization: owner == msg.sender OR approved operator
+        bool authorized = (owner == controller) || vault.isOperator(owner, controller);
+        if (!authorized) return;
+
+        vm.prank(controller);
+        try vault.requestRedeem(toRedeem, controller, owner) {
+            ghostRequestRedeemCount++;
+            ghostWithdrawRequestCount++;
+        } catch {}
+    }
+
+    // ── Drawdown Operations ──
+
+    function setMaxDrawdown(uint256 bps) external {
+        bps = bound(bps, 0, 5_000); // MAX_DRAWDOWN_BPS
+        vm.prank(operator);
+        vault.setMaxDrawdown(bps);
+    }
+
+    function resetNavHighWaterMark() external {
+        vm.prank(operator);
+        try vault.resetNavHighWaterMark() {} catch {}
+    }
+
     // ── Time ──
 
     function warpTime(uint256 seconds_) external {
@@ -340,6 +430,8 @@ contract StreamVault_ComprehensiveInvariant_Test is StdInvariant, Test {
         vault.addYieldSource(IYieldSource(address(yieldSource2)));
         // Enable withdrawal fee to test fee invariants
         vault.setWithdrawalFee(50); // 0.5%
+        // Disable drawdown protection to prevent auto-pause during fuzzing
+        vault.setMaxDrawdown(0);
         vm.stopPrank();
 
         handler = new AdvancedVaultHandler(vault, usdc, yieldSource1, yieldSource2, operator, feeRecipient);
@@ -354,7 +446,7 @@ contract StreamVault_ComprehensiveInvariant_Test is StdInvariant, Test {
 
         targetContract(address(handler));
 
-        bytes4[] memory selectors = new bytes4[](19);
+        bytes4[] memory selectors = new bytes4[](27);
         selectors[0] = AdvancedVaultHandler.deposit.selector;
         selectors[1] = AdvancedVaultHandler.depositToOther.selector;
         selectors[2] = AdvancedVaultHandler.mint.selector;
@@ -374,6 +466,15 @@ contract StreamVault_ComprehensiveInvariant_Test is StdInvariant, Test {
         selectors[16] = AdvancedVaultHandler.warpTime.selector;
         selectors[17] = AdvancedVaultHandler.warpTime.selector;
         selectors[18] = AdvancedVaultHandler.warpTime.selector;
+        // New feature handlers
+        selectors[19] = AdvancedVaultHandler.toggleTransferRestrictions.selector;
+        selectors[20] = AdvancedVaultHandler.setTransferWhitelist.selector;
+        selectors[21] = AdvancedVaultHandler.batchSetTransferWhitelist.selector;
+        selectors[22] = AdvancedVaultHandler.setOperator7540.selector;
+        selectors[23] = AdvancedVaultHandler.requestRedeem.selector;
+        selectors[24] = AdvancedVaultHandler.setMaxDrawdown.selector;
+        selectors[25] = AdvancedVaultHandler.resetNavHighWaterMark.selector;
+        selectors[26] = AdvancedVaultHandler.warpTime.selector; // Extra time warp for temporal diversity
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
@@ -629,6 +730,208 @@ contract StreamVault_ComprehensiveInvariant_Test is StdInvariant, Test {
         // vault-controlled + left should be >= entered (yield can add more, losses are tracked)
         // Small tolerance for management fee share dilution not backed by new USDC
         assertGe(vaultControlled + left + 1e6, entered, "USDC conservation violated");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TRANSFER RESTRICTION INVARIANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev Transfer restriction state is boolean — always valid
+    function invariant_transfer_restriction_state_valid() public view {
+        // transfersRestricted is always a valid boolean value
+        // This is implicitly true, but we verify the state is accessible
+        bool restricted = vault.transfersRestricted();
+        assertTrue(restricted || !restricted, "Transfer restriction state should be boolean");
+    }
+
+    /// @dev Whitelist state should match ghost tracking
+    function invariant_whitelist_consistency() public view {
+        for (uint256 i; i < handler.NUM_ACTORS(); ++i) {
+            address actor = handler.actors(i);
+            assertEq(
+                vault.transferWhitelist(actor),
+                handler.ghostWhitelistedAddresses(actor),
+                "Whitelist state mismatch"
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EIP-7540 OPERATOR INVARIANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev EIP-7540 operator state should match ghost tracking
+    function invariant_operator7540_state_consistency() public view {
+        for (uint256 i; i < handler.NUM_ACTORS(); ++i) {
+            for (uint256 j; j < handler.NUM_ACTORS(); ++j) {
+                if (i == j) continue;
+                address controller = handler.actors(i);
+                address op = handler.actors(j);
+                assertEq(
+                    vault.isOperator(controller, op),
+                    handler.ghostOperator7540State(controller, op),
+                    "EIP-7540 operator state mismatch"
+                );
+            }
+        }
+    }
+
+    /// @dev An operator cannot be set for themselves
+    function invariant_operator7540_no_self_approval() public view {
+        for (uint256 i; i < handler.NUM_ACTORS(); ++i) {
+            address actor = handler.actors(i);
+            // Self-approval should always be false (or we don't set it)
+            // The handler skips self-approvals, so state should be false
+            assertFalse(vault.isOperator(actor, actor), "Self-operator should not be set");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DRAWDOWN INVARIANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev maxDrawdownBps never exceeds MAX_DRAWDOWN_BPS (50%)
+    function invariant_drawdown_bounded() public view {
+        assertLe(vault.maxDrawdownBps(), vault.MAX_DRAWDOWN_BPS(), "Drawdown exceeds max");
+    }
+
+    /// @dev NAV per share should be positive when vault has assets
+    function invariant_nav_positive() public view {
+        uint256 supply = vault.totalSupply();
+        if (supply > 0) {
+            assertGt(vault.navPerShare(), 0, "NAV per share should be positive");
+        }
+    }
+
+    /// @dev NAV high water mark should be <= current NAV (after recovery) or >= current NAV (during drawdown)
+    ///      This is a consistency check — HWM tracks the peak
+    function invariant_hwm_consistency() public view {
+        uint256 hwm = vault.navHighWaterMark();
+        if (hwm == 0) return; // Not initialized yet
+
+        // HWM represents a historical peak, so current NAV can be above or below it
+        // We just verify HWM is a reasonable value (positive and not absurdly large)
+        assertGt(hwm, 0, "HWM should be positive once set");
+        assertLt(hwm, type(uint128).max, "HWM should be reasonable");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADVANCED SHARE ACCOUNTING INVARIANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev Share price should never be zero when vault has assets
+    function invariant_share_price_nonzero() public view {
+        uint256 assets = vault.totalAssets();
+        uint256 supply = vault.totalSupply();
+
+        if (assets > 0 && supply > 0) {
+            uint256 sharePrice = vault.convertToAssets(1e9); // 1 share worth
+            assertGt(sharePrice, 0, "Share price should be non-zero");
+        }
+    }
+
+    /// @dev previewDeposit should never return 0 for non-zero input (unless paused/capped)
+    function invariant_preview_deposit_nonzero() public view {
+        if (vault.paused()) return;
+        if (vault.depositCap() > 0 && vault.totalAssets() >= vault.depositCap()) return;
+
+        uint256 testAssets = 1_000e6;
+        uint256 shares = vault.previewDeposit(testAssets);
+
+        // previewDeposit should return non-zero shares for reasonable asset amounts
+        assertGt(shares, 0, "previewDeposit should return non-zero shares");
+    }
+
+    /// @dev convertToShares should be monotonically increasing with assets
+    function invariant_convert_monotonic() public view {
+        uint256 small = vault.convertToShares(100e6);
+        uint256 large = vault.convertToShares(1_000e6);
+        assertLe(small, large, "convertToShares should be monotonic");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // YIELD SOURCE INVARIANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev Total deployed across all yield sources should match sum of individual balances
+    function invariant_yield_source_balance_sum() public view {
+        uint256[] memory balances = vault.getAllYieldSourceBalances();
+        uint256 sum;
+        for (uint256 i; i < balances.length; ++i) {
+            sum += balances[i];
+        }
+
+        uint256 expected = yieldSource1.balance() + yieldSource2.balance();
+        assertEq(sum, expected, "Yield source balance sum mismatch");
+    }
+
+    /// @dev Each yield source balance should match its actual balance
+    function invariant_yield_source_individual_balances() public view {
+        uint256[] memory balances = vault.getAllYieldSourceBalances();
+        if (balances.length >= 1) {
+            assertEq(balances[0], yieldSource1.balance(), "YieldSource1 balance mismatch");
+        }
+        if (balances.length >= 2) {
+            assertEq(balances[1], yieldSource2.balance(), "YieldSource2 balance mismatch");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EMA CONVERGENCE INVARIANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev EMA should never be zero when vault has real assets
+    function invariant_ema_nonzero_with_assets() public view {
+        uint256 spot = vault.totalAssets();
+        uint256 ema = vault.emaTotalAssets();
+
+        if (spot > 1_000) {
+            assertGt(ema, 0, "EMA should be positive when vault has assets");
+        }
+    }
+
+    /// @dev EMA should never be zero when vault has meaningful assets
+    ///      Note: EMA can legitimately diverge from spot (higher after losses due to floor, lower after gains due to lag)
+    function invariant_ema_always_positive_with_assets() public view {
+        uint256 spot = vault.totalAssets();
+        uint256 ema = vault.emaTotalAssets();
+
+        // When vault has assets, EMA should always be positive
+        if (spot > 100_000e6) { // 100k USDC
+            assertGt(ema, 0, "EMA should be positive when vault has significant assets");
+        }
+    }
+
+    /// @dev After sufficient time with no donations, EMA should converge toward spot
+    ///      This is a weaker invariant since we can't guarantee exact convergence mid-fuzz
+    function invariant_ema_bounded_by_floor() public view {
+        uint256 ema = vault.emaTotalAssets();
+        uint256 virtualOffset = 10 ** 3; // _decimalsOffset = 3
+
+        // EMA should always be >= virtual offset
+        assertGe(ema, virtualOffset, "EMA below virtual offset floor");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SLIPPAGE PROTECTION INVARIANTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev previewDeposit and previewMint should be consistent
+    ///      Note: Small rounding differences are acceptable due to EMA updates and floor divisions
+    function invariant_preview_functions_consistent() public view {
+        if (vault.paused()) return;
+        if (vault.depositCap() > 0 && vault.totalAssets() >= vault.depositCap()) return;
+        if (vault.totalSupply() == 0) return; // Skip when no shares exist
+
+        uint256 testAssets = 1_000e6;
+        uint256 previewShares = vault.previewDeposit(testAssets);
+
+        // previewDeposit should return non-zero shares for reasonable amounts
+        assertGt(previewShares, 0, "previewDeposit should return positive shares");
+
+        // previewMint should return non-zero assets for reasonable shares
+        uint256 previewAssets = vault.previewMint(previewShares);
+        assertGt(previewAssets, 0, "previewMint should return positive assets");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

@@ -11,6 +11,7 @@ import {MockYieldSource} from "../src/MockYieldSource.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {ReentrantERC20} from "./mocks/ReentrantERC20.sol";
 import {IERC7540Redeem, IERC7540Operator} from "../src/interfaces/IERC7540.sol";
+import {RiskModel} from "../src/libraries/RiskModel.sol";
 
 /// @dev Helper for deploying StreamVault behind a UUPS proxy in tests.
 abstract contract ProxyDeployHelper {
@@ -2223,5 +2224,254 @@ contract FeeLib_Test is Test {
         bps = bound(bps, 0, 10_000);
         uint256 fee = FeeLib.computePerformanceFee(profit, bps);
         assertLe(fee, profit);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRE Malformed Input Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_CRE_MalformedInput_Test is Test, ProxyDeployHelper {
+    MockERC20 usdc;
+    StreamVault vault;
+    MockYieldSource yieldSource;
+    address operator = makeAddr("operator");
+    address feeRecipient = makeAddr("feeRecipient");
+    address forwarder = makeAddr("chainlinkForwarder");
+    address alice = makeAddr("alice");
+
+    function setUp() public {
+        usdc = new MockERC20("USDC", "USDC", 6);
+        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, 3600, "svUSDC", "svUSDC");
+        yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
+
+        vm.startPrank(operator);
+        vault.addYieldSource(IYieldSource(address(yieldSource)));
+        vault.setChainlinkForwarder(forwarder);
+        vault.setMaxDrawdown(0);
+        vm.stopPrank();
+    }
+
+    function _mintAndDeposit(address user, uint256 amount) internal returns (uint256) {
+        usdc.mint(user, amount);
+        vm.startPrank(user);
+        usdc.approve(address(vault), amount);
+        uint256 shares = vault.deposit(amount, user);
+        vm.stopPrank();
+        return shares;
+    }
+
+    function test_onReport_invalidActionReverts() public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        // Invalid action type (255)
+        bytes memory report = abi.encode(uint8(255), bytes(""));
+
+        vm.prank(forwarder);
+        vm.expectRevert(abi.encodeWithSelector(StreamVault.InvalidAction.selector, 255));
+        vault.onReport(bytes(""), report);
+    }
+
+    function test_onReport_onlyForwarder() public {
+        bytes memory report = abi.encode(uint8(0), bytes(""));
+
+        vm.prank(alice);
+        vm.expectRevert(StreamVault.OnlyForwarder.selector);
+        vault.onReport(bytes(""), report);
+    }
+
+    function test_onReport_updateRiskParams_arrayMismatch() public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        // Mismatched array lengths
+        address[] memory sources = new address[](2);
+        sources[0] = address(yieldSource);
+        sources[1] = address(yieldSource);
+
+        RiskModel.SourceRiskParams[] memory params = new RiskModel.SourceRiskParams[](1);
+        params[0] = RiskModel.SourceRiskParams({
+            liquidityHaircutBps: 100,
+            stressOutflowBps: 500,
+            maxConcentrationBps: 5000,
+            lastUpdated: uint64(block.timestamp),
+            riskTier: 0
+        });
+
+        RiskModel.RiskSnapshot memory snapshot = RiskModel.RiskSnapshot({
+            stressedLCR: 15000,
+            aggregateRiskScore: 5000,
+            timestamp: uint64(block.timestamp),
+            systemStatus: 0
+        });
+
+        bytes memory actionData = abi.encode(sources, params, snapshot);
+        bytes memory report = abi.encode(uint8(0), actionData); // ACTION_UPDATE_RISK_PARAMS
+
+        vm.prank(forwarder);
+        vm.expectRevert(StreamVault.ArrayLengthMismatch.selector);
+        vault.onReport(bytes(""), report);
+    }
+
+    function test_onReport_updateRiskParams_unknownSource() public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        // Unknown source address
+        address[] memory sources = new address[](1);
+        sources[0] = address(0xdead); // Not registered
+
+        RiskModel.SourceRiskParams[] memory params = new RiskModel.SourceRiskParams[](1);
+        params[0] = RiskModel.SourceRiskParams({
+            liquidityHaircutBps: 100,
+            stressOutflowBps: 500,
+            maxConcentrationBps: 5000,
+            lastUpdated: uint64(block.timestamp),
+            riskTier: 0
+        });
+
+        RiskModel.RiskSnapshot memory snapshot = RiskModel.RiskSnapshot({
+            stressedLCR: 15000,
+            aggregateRiskScore: 5000,
+            timestamp: uint64(block.timestamp),
+            systemStatus: 0
+        });
+
+        bytes memory actionData = abi.encode(sources, params, snapshot);
+        bytes memory report = abi.encode(uint8(0), actionData);
+
+        vm.prank(forwarder);
+        vm.expectRevert(abi.encodeWithSelector(StreamVault.UnknownSource.selector, address(0xdead)));
+        vault.onReport(bytes(""), report);
+    }
+
+    function test_onReport_updateRiskParams_haircutTooHigh() public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        address[] memory sources = new address[](1);
+        sources[0] = address(yieldSource);
+
+        RiskModel.SourceRiskParams[] memory params = new RiskModel.SourceRiskParams[](1);
+        params[0] = RiskModel.SourceRiskParams({
+            liquidityHaircutBps: 10001, // Exceeds MAX_HAIRCUT_BPS (10000)
+            stressOutflowBps: 500,
+            maxConcentrationBps: 5000,
+            lastUpdated: uint64(block.timestamp),
+            riskTier: 0
+        });
+
+        RiskModel.RiskSnapshot memory snapshot = RiskModel.RiskSnapshot({
+            stressedLCR: 15000,
+            aggregateRiskScore: 5000,
+            timestamp: uint64(block.timestamp),
+            systemStatus: 0
+        });
+
+        bytes memory actionData = abi.encode(sources, params, snapshot);
+        bytes memory report = abi.encode(uint8(0), actionData);
+
+        vm.prank(forwarder);
+        vm.expectRevert(StreamVault.HaircutTooHigh.selector);
+        vault.onReport(bytes(""), report);
+    }
+
+    function test_onReport_updateRiskParams_invalidConcentration() public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        address[] memory sources = new address[](1);
+        sources[0] = address(yieldSource);
+
+        RiskModel.SourceRiskParams[] memory params = new RiskModel.SourceRiskParams[](1);
+        params[0] = RiskModel.SourceRiskParams({
+            liquidityHaircutBps: 100,
+            stressOutflowBps: 500,
+            maxConcentrationBps: 10001, // Exceeds BPS (10000)
+            lastUpdated: uint64(block.timestamp),
+            riskTier: 0
+        });
+
+        RiskModel.RiskSnapshot memory snapshot = RiskModel.RiskSnapshot({
+            stressedLCR: 15000,
+            aggregateRiskScore: 5000,
+            timestamp: uint64(block.timestamp),
+            systemStatus: 0
+        });
+
+        bytes memory actionData = abi.encode(sources, params, snapshot);
+        bytes memory report = abi.encode(uint8(0), actionData);
+
+        vm.prank(forwarder);
+        vm.expectRevert(StreamVault.InvalidConcentration.selector);
+        vault.onReport(bytes(""), report);
+    }
+
+    function test_onReport_defensiveRebalance_unknownSource() public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        bytes memory actionData = abi.encode(address(0xdead), uint256(1000e6));
+        bytes memory report = abi.encode(uint8(1), actionData); // ACTION_DEFENSIVE_REBALANCE
+
+        vm.prank(forwarder);
+        vm.expectRevert(abi.encodeWithSelector(StreamVault.UnknownSource.selector, address(0xdead)));
+        vault.onReport(bytes(""), report);
+    }
+
+    function test_onReport_emergencyPause_success() public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        bytes memory actionData = abi.encode(uint8(0)); // severity 0
+        bytes memory report = abi.encode(uint8(2), actionData); // ACTION_EMERGENCY_PAUSE
+
+        assertFalse(vault.paused());
+
+        vm.prank(forwarder);
+        vault.onReport(bytes(""), report);
+
+        assertTrue(vault.paused());
+    }
+
+    function test_onReport_settleEpoch_success() public {
+        _mintAndDeposit(alice, 10_000e6);
+        vm.warp(block.timestamp + 3601);
+
+        bytes memory actionData = bytes("");
+        bytes memory report = abi.encode(uint8(3), actionData); // ACTION_SETTLE_EPOCH
+
+        uint256 epochBefore = vault.currentEpochId();
+
+        vm.prank(forwarder);
+        vault.onReport(bytes(""), report);
+
+        assertEq(vault.currentEpochId(), epochBefore + 1);
+    }
+
+    function test_onReport_harvestYield_success() public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        vm.prank(operator);
+        vault.deployToYield(0, 5_000e6);
+
+        vm.warp(block.timestamp + 1000);
+
+        address[] memory sources = new address[](1);
+        sources[0] = address(yieldSource);
+
+        bytes memory actionData = abi.encode(sources);
+        bytes memory report = abi.encode(uint8(4), actionData); // ACTION_HARVEST_YIELD
+
+        vm.prank(forwarder);
+        vault.onReport(bytes(""), report);
+        // Should complete without revert
+    }
+
+    function testFuzz_onReport_invalidActionTypes(uint8 actionType) public {
+        _mintAndDeposit(alice, 10_000e6);
+
+        // Skip valid action types (0-4)
+        vm.assume(actionType > 4);
+
+        bytes memory report = abi.encode(actionType, bytes(""));
+
+        vm.prank(forwarder);
+        vm.expectRevert(abi.encodeWithSelector(StreamVault.InvalidAction.selector, actionType));
+        vault.onReport(bytes(""), report);
     }
 }

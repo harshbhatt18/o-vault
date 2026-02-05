@@ -272,6 +272,8 @@ contract StreamVault is
     error RescueUnderlyingForbidden();
     error SignatureExpired();
     error InvalidSigner();
+    error SlippageExceeded(uint256 actual, uint256 minimum);
+    error YieldSourceBalanceMismatch(uint256 expected, uint256 actual);
 
     // ─── Modifiers ──────────────────────────────────────────────────────
 
@@ -442,6 +444,38 @@ contract StreamVault is
         return 0;
     }
 
+    // ─── Slippage-Protected Deposit Functions ─────────────────────────────
+
+    /// @notice Deposit assets with slippage protection.
+    /// @param assets Amount of underlying assets to deposit.
+    /// @param receiver Address to receive the shares.
+    /// @param minSharesOut Minimum shares to receive; reverts if actual shares < minSharesOut.
+    /// @return shares Actual shares minted.
+    function depositWithSlippage(uint256 assets, address receiver, uint256 minSharesOut)
+        external
+        returns (uint256 shares)
+    {
+        shares = deposit(assets, receiver);
+        if (shares < minSharesOut) {
+            revert SlippageExceeded(shares, minSharesOut);
+        }
+    }
+
+    /// @notice Mint exact shares with slippage protection on assets spent.
+    /// @param shares Exact number of shares to mint.
+    /// @param receiver Address to receive the shares.
+    /// @param maxAssetsIn Maximum assets to spend; reverts if actual assets > maxAssetsIn.
+    /// @return assets Actual assets spent.
+    function mintWithSlippage(uint256 shares, address receiver, uint256 maxAssetsIn)
+        external
+        returns (uint256 assets)
+    {
+        assets = mint(shares, receiver);
+        if (assets > maxAssetsIn) {
+            revert SlippageExceeded(assets, maxAssetsIn);
+        }
+    }
+
     /// @notice Always reverts — sync withdrawals are disabled.
     function previewWithdraw(uint256) public pure override returns (uint256) {
         revert SyncWithdrawDisabled();
@@ -578,7 +612,15 @@ contract StreamVault is
         _accrueManagementFee();
         _updateEma();
 
+        uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
         yieldSources[sourceIndex].withdraw(amount);
+        uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
+
+        // Verify we received the expected amount (within 1 wei tolerance for rounding)
+        uint256 received = balanceAfter - balanceBefore;
+        if (received + 1 < amount) {
+            revert YieldSourceBalanceMismatch(amount, received);
+        }
 
         emit WithdrawnFromYield(sourceIndex, amount);
     }
@@ -1319,9 +1361,16 @@ contract StreamVault is
                 if (srcBal == 0) continue;
 
                 uint256 pull = remaining > srcBal ? srcBal : remaining;
+                uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
                 yieldSources[i].withdraw(pull);
-                remaining -= pull;
+                uint256 received = IERC20(asset()).balanceOf(address(this)) - balanceBefore;
 
+                // Verify we received the expected amount (within 1 wei tolerance)
+                if (received + 1 < pull) {
+                    revert YieldSourceBalanceMismatch(pull, received);
+                }
+
+                remaining -= pull;
                 emit WithdrawnFromYield(i, pull);
             }
 

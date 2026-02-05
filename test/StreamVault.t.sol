@@ -1213,6 +1213,210 @@ contract StreamVault_Fuzz_Test is StreamVaultTestBase {
         (,, uint256 assetsOwed,) = vault.epochs(epochId);
         assertLe(assetsOwed, totalAssetsBefore + 1);
     }
+
+    // ── Additional Fuzz Tests for Edge Cases ──
+
+    function testFuzz_withdrawalFee_accountingIdentity(uint256 amount, uint256 feeBps) public {
+        amount = bound(amount, 10_000e6, 10_000_000e6);
+        feeBps = bound(feeBps, 1, 100); // 0.01% to 1%
+
+        vm.prank(operator);
+        vault.setWithdrawalFee(feeBps);
+
+        uint256 shares = _mintAndDeposit(alice, amount);
+        _warpForSettle();
+
+        uint256 epochId = vault.currentEpochId();
+
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        (,, uint256 assetsOwed,) = vault.epochs(epochId);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 recipientBefore = usdc.balanceOf(feeRecipient);
+
+        vm.prank(alice);
+        vault.claimWithdrawal(epochId);
+
+        uint256 payout = usdc.balanceOf(alice) - aliceBefore;
+        uint256 fee = usdc.balanceOf(feeRecipient) - recipientBefore;
+
+        // Accounting identity: payout + fee == assetsOwed
+        assertEq(payout + fee, assetsOwed, "Withdrawal fee accounting broken");
+    }
+
+    function testFuzz_lockup_exactBoundary(uint256 lockupDuration, uint256 waitTime) public {
+        lockupDuration = bound(lockupDuration, 1 hours, 7 days);
+        waitTime = bound(waitTime, 0, lockupDuration + 1 hours);
+
+        vm.prank(operator);
+        vault.setLockupPeriod(lockupDuration);
+
+        uint256 shares = _mintAndDeposit(alice, INITIAL_DEPOSIT);
+        uint256 depositTime = block.timestamp;
+
+        vm.warp(depositTime + waitTime);
+
+        vm.prank(alice);
+        if (waitTime < lockupDuration) {
+            vm.expectRevert(StreamVault.LockupPeriodActive.selector);
+            vault.requestWithdraw(shares);
+        } else {
+            // Should succeed
+            vault.requestWithdraw(shares);
+            assertEq(vault.balanceOf(alice), 0);
+        }
+    }
+
+    function testFuzz_depositCap_enforcement(uint256 cap, uint256 deposit1, uint256 deposit2) public {
+        cap = bound(cap, 10_000e6, 100_000_000e6);
+        deposit1 = bound(deposit1, 1e6, cap);
+        deposit2 = bound(deposit2, 1e6, cap);
+
+        vm.prank(operator);
+        vault.setDepositCap(cap);
+
+        // First deposit should succeed if within cap
+        if (deposit1 <= cap) {
+            _mintAndDeposit(alice, deposit1);
+        }
+
+        uint256 remaining = cap > vault.totalAssets() ? cap - vault.totalAssets() : 0;
+
+        // maxDeposit should return remaining capacity
+        assertEq(vault.maxDeposit(bob), remaining, "maxDeposit incorrect");
+    }
+
+    function testFuzz_convertToShares_convertToAssets_inverses(uint256 assets) public {
+        assets = bound(assets, 1e6, 100_000_000e6);
+
+        // First deposit to establish share price
+        _mintAndDeposit(alice, INITIAL_DEPOSIT);
+        _warpForSettle();
+
+        uint256 shares = vault.convertToShares(assets);
+        uint256 backToAssets = vault.convertToAssets(shares);
+
+        // Due to floor rounding, backToAssets <= assets
+        assertLe(backToAssets, assets, "Round-trip inflated assets");
+        // But should be close (within 1 unit typically)
+        assertApproxEqAbs(backToAssets, assets, 2, "Round-trip deviation too large");
+    }
+
+    function testFuzz_partialWithdraw_multipleRequests(uint256 fraction1, uint256 fraction2) public {
+        fraction1 = bound(fraction1, 10, 50);
+        fraction2 = bound(fraction2, 10, 50);
+
+        uint256 shares = _mintAndDeposit(alice, INITIAL_DEPOSIT);
+        _warpForSettle();
+
+        uint256 withdraw1 = shares * fraction1 / 100;
+        uint256 withdraw2 = (shares - withdraw1) * fraction2 / 100;
+
+        // First partial withdrawal
+        vm.prank(alice);
+        vault.requestWithdraw(withdraw1);
+
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        _warpForSettle();
+
+        // Second partial withdrawal
+        vm.prank(alice);
+        vault.requestWithdraw(withdraw2);
+
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        // Alice should have remaining shares
+        uint256 remaining = shares - withdraw1 - withdraw2;
+        assertEq(vault.balanceOf(alice), remaining, "Remaining shares incorrect");
+    }
+
+    function testFuzz_yieldSimulation_totalAssetsIncreases(uint256 deposit, uint256 yieldAmount) public {
+        deposit = bound(deposit, 10_000e6, 10_000_000e6);
+        yieldAmount = bound(yieldAmount, 1e4, deposit / 10); // Up to 10% yield
+
+        _mintAndDeposit(alice, deposit);
+        _warpForSettle();
+
+        // Deploy to yield source
+        vm.prank(operator);
+        vault.deployToYield(0, deposit / 2);
+
+        uint256 totalAssetsBefore = vault.totalAssets();
+
+        // Simulate yield
+        yieldSource.simulateYield(yieldAmount);
+
+        uint256 totalAssetsAfter = vault.totalAssets();
+        assertGe(totalAssetsAfter, totalAssetsBefore + yieldAmount - 1, "Yield not reflected");
+    }
+
+    function testFuzz_multipleActors_shareDistribution(uint256 a, uint256 b, uint256 c) public {
+        a = bound(a, 1e6, 10_000_000e6);
+        b = bound(b, 1e6, 10_000_000e6);
+        c = bound(c, 1e6, 10_000_000e6);
+
+        uint256 sharesA = _mintAndDeposit(alice, a);
+        uint256 sharesB = _mintAndDeposit(bob, b);
+        uint256 sharesC = _mintAndDeposit(carol, c);
+
+        uint256 totalShares = sharesA + sharesB + sharesC;
+        assertEq(vault.totalSupply(), totalShares, "Total supply mismatch");
+
+        // Share distribution should be proportional to deposits
+        uint256 total = a + b + c;
+        assertApproxEqRel(sharesA * total, a * totalShares, 0.01e18, "Alice share ratio off");
+        assertApproxEqRel(sharesB * total, b * totalShares, 0.01e18, "Bob share ratio off");
+        assertApproxEqRel(sharesC * total, c * totalShares, 0.01e18, "Carol share ratio off");
+    }
+
+    function testFuzz_epochSettlement_noSharesNoPayout(uint256 warpTime) public {
+        warpTime = bound(warpTime, MIN_EPOCH + 1, 7 days);
+
+        _mintAndDeposit(alice, INITIAL_DEPOSIT);
+
+        vm.warp(block.timestamp + warpTime);
+
+        // Settle with no withdrawal requests
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        (StreamVault.EpochStatus status, uint256 burned, uint256 owed,) = vault.epochs(0);
+        assertEq(uint8(status), uint8(StreamVault.EpochStatus.SETTLED));
+        assertEq(burned, 0, "No shares should be burned");
+        assertEq(owed, 0, "No assets should be owed");
+    }
+
+    function testFuzz_transferRestriction_whitelistWorks(uint256 amount, uint256 transferFrac) public {
+        amount = bound(amount, 10_000e6, 1_000_000e6);
+        transferFrac = bound(transferFrac, 1, 100);
+
+        uint256 shares = _mintAndDeposit(alice, amount);
+
+        // Enable restrictions
+        vm.prank(operator);
+        vault.setTransfersRestricted(true);
+
+        // Whitelist bob
+        vm.prank(operator);
+        vault.setTransferWhitelist(bob, true);
+
+        uint256 toTransfer = shares * transferFrac / 100;
+
+        // Transfer to whitelisted bob should succeed
+        vm.prank(alice);
+        vault.transfer(bob, toTransfer);
+
+        assertEq(vault.balanceOf(bob), toTransfer);
+        assertEq(vault.balanceOf(alice), shares - toTransfer);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1572,5 +1776,223 @@ contract StreamVault_Lockup_Test is StreamVaultTestBase {
 
         vm.prank(alice);
         vault.requestWithdraw(shares);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. Slippage Protection Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_SlippageProtection_Test is StreamVaultTestBase {
+    function test_depositWithSlippage_success() public {
+        uint256 amount = 1_000e6;
+        uint256 expectedShares = vault.previewDeposit(amount);
+
+        usdc.mint(alice, amount);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), amount);
+        uint256 shares = vault.depositWithSlippage(amount, alice, expectedShares);
+        vm.stopPrank();
+
+        assertEq(shares, expectedShares);
+        assertEq(vault.balanceOf(alice), shares);
+    }
+
+    function test_depositWithSlippage_revertsOnSlippage() public {
+        uint256 amount = 1_000e6;
+        uint256 expectedShares = vault.previewDeposit(amount);
+        uint256 unreasonablyHighMin = expectedShares + 1e9; // Way too high
+
+        usdc.mint(alice, amount);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), amount);
+        vm.expectRevert(abi.encodeWithSelector(StreamVault.SlippageExceeded.selector, expectedShares, unreasonablyHighMin));
+        vault.depositWithSlippage(amount, alice, unreasonablyHighMin);
+        vm.stopPrank();
+    }
+
+    function test_mintWithSlippage_success() public {
+        uint256 sharesToMint = 1_000e9;
+        uint256 expectedAssets = vault.previewMint(sharesToMint);
+
+        usdc.mint(alice, expectedAssets);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), expectedAssets);
+        uint256 assets = vault.mintWithSlippage(sharesToMint, alice, expectedAssets);
+        vm.stopPrank();
+
+        assertEq(assets, expectedAssets);
+        assertEq(vault.balanceOf(alice), sharesToMint);
+    }
+
+    function test_mintWithSlippage_revertsOnSlippage() public {
+        uint256 sharesToMint = 1_000e9;
+        uint256 expectedAssets = vault.previewMint(sharesToMint);
+        uint256 unreasonablyLowMax = expectedAssets / 2; // Way too low
+
+        usdc.mint(alice, expectedAssets);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), expectedAssets);
+        vm.expectRevert(abi.encodeWithSelector(StreamVault.SlippageExceeded.selector, expectedAssets, unreasonablyLowMax));
+        vault.mintWithSlippage(sharesToMint, alice, unreasonablyLowMax);
+        vm.stopPrank();
+    }
+
+    function testFuzz_depositWithSlippage_alwaysRespectsBound(uint256 amount, uint256 slippageTolerance) public {
+        amount = bound(amount, 1e6, 10_000_000e6);
+        slippageTolerance = bound(slippageTolerance, 0, 500); // 0-5% slippage tolerance in bps
+
+        uint256 expectedShares = vault.previewDeposit(amount);
+        uint256 minShares = expectedShares * (10_000 - slippageTolerance) / 10_000;
+
+        usdc.mint(alice, amount);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), amount);
+        uint256 actualShares = vault.depositWithSlippage(amount, alice, minShares);
+        vm.stopPrank();
+
+        assertGe(actualShares, minShares, "Slippage protection violated");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. Yield Source Balance Verification Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_YieldSourceBalanceVerification_Test is StreamVaultTestBase {
+    function test_withdrawFromYield_verifiesBalance() public {
+        _mintAndDeposit(alice, 10_000e6);
+        _warpForSettle();
+
+        // Deploy to yield
+        vm.prank(operator);
+        vault.deployToYield(0, 5_000e6);
+
+        uint256 vaultBalanceBefore = usdc.balanceOf(address(vault));
+
+        // Withdraw from yield
+        vm.prank(operator);
+        vault.withdrawFromYield(0, 2_000e6);
+
+        uint256 vaultBalanceAfter = usdc.balanceOf(address(vault));
+        assertEq(vaultBalanceAfter - vaultBalanceBefore, 2_000e6);
+    }
+
+    function test_settleEpoch_verifiesWaterfallBalance() public {
+        _mintAndDeposit(alice, 10_000e6);
+        _warpForSettle();
+
+        // Deploy most to yield, leave little idle
+        vm.prank(operator);
+        vault.deployToYield(0, 9_000e6);
+
+        uint256 shares = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+
+        // Settlement will need to pull from yield sources
+        vm.prank(operator);
+        vault.settleEpoch();
+
+        // Verify settlement succeeded and assets were pulled
+        (StreamVault.EpochStatus status,, uint256 owed,) = vault.epochs(0);
+        assertEq(uint8(status), uint8(StreamVault.EpochStatus.SETTLED));
+        assertGt(owed, 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. Differential Fuzz Tests (ERC-4626 Reference Comparison)
+// ─────────────────────────────────────────────────────────────────────────────
+
+contract StreamVault_DifferentialFuzz_Test is StreamVaultTestBase {
+    /// @dev ERC-4626 property: previewDeposit MUST equal actual deposit shares
+    function testFuzz_differential_previewDeposit_eq_deposit(uint256 amount) public {
+        amount = bound(amount, 1e6, 100_000_000e6);
+
+        uint256 preview = vault.previewDeposit(amount);
+
+        usdc.mint(alice, amount);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), amount);
+        uint256 actual = vault.deposit(amount, alice);
+        vm.stopPrank();
+
+        assertEq(actual, preview, "previewDeposit != deposit");
+    }
+
+    /// @dev ERC-4626 property: previewMint MUST equal actual mint assets
+    function testFuzz_differential_previewMint_eq_mint(uint256 shares) public {
+        shares = bound(shares, 1e9, 100_000e9);
+
+        uint256 preview = vault.previewMint(shares);
+
+        usdc.mint(alice, preview);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), preview);
+        uint256 actual = vault.mint(shares, alice);
+        vm.stopPrank();
+
+        assertEq(actual, preview, "previewMint != mint");
+    }
+
+    /// @dev ERC-4626 property: convertToShares(convertToAssets(s)) <= s (no inflation)
+    function testFuzz_differential_noShareInflation(uint256 shares) public {
+        // First establish a share price
+        _mintAndDeposit(alice, 10_000e6);
+        _warpForSettle();
+
+        shares = bound(shares, 1e9, vault.totalSupply());
+
+        uint256 assets = vault.convertToAssets(shares);
+        uint256 backToShares = vault.convertToShares(assets);
+
+        assertLe(backToShares, shares, "Share inflation detected");
+    }
+
+    /// @dev ERC-4626 property: convertToAssets(convertToShares(a)) <= a (no asset inflation)
+    function testFuzz_differential_noAssetInflation(uint256 assets) public {
+        // First establish a share price
+        _mintAndDeposit(alice, 10_000e6);
+        _warpForSettle();
+
+        assets = bound(assets, 1e6, vault.totalAssets());
+
+        uint256 shares = vault.convertToShares(assets);
+        uint256 backToAssets = vault.convertToAssets(shares);
+
+        assertLe(backToAssets, assets, "Asset inflation detected");
+    }
+
+    /// @dev ERC-4626 property: totalAssets MUST equal underlying balance (for simple case)
+    function testFuzz_differential_totalAssets_consistency(uint256 amount) public {
+        amount = bound(amount, 1e6, 100_000_000e6);
+
+        _mintAndDeposit(alice, amount);
+
+        // With no yield deployed and no claimable, totalAssets == idle balance
+        uint256 idle = usdc.balanceOf(address(vault));
+        uint256 claimable = vault.totalClaimableAssets();
+        uint256 deployed = yieldSource.balance();
+
+        assertEq(vault.totalAssets(), idle + deployed - claimable, "totalAssets identity violated");
+    }
+
+    /// @dev ERC-4626 property: deposit(x).convertToAssets <= x (depositor doesn't gain)
+    function testFuzz_differential_depositorDoesntGain(uint256 amount) public {
+        amount = bound(amount, 1e6, 100_000_000e6);
+
+        // First deposit to establish share price
+        _mintAndDeposit(bob, 10_000e6);
+        _warpForSettle();
+
+        usdc.mint(alice, amount);
+        vm.startPrank(alice);
+        usdc.approve(address(vault), amount);
+        uint256 shares = vault.deposit(amount, alice);
+        vm.stopPrank();
+
+        uint256 assetsBack = vault.convertToAssets(shares);
+        assertLe(assetsBack, amount, "Depositor gained value - potential exploit");
     }
 }
