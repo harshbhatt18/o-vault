@@ -13,8 +13,6 @@ import {IYieldSource} from "../src/IYieldSource.sol";
 /// @notice Deploys the full StreamVault system with:
 ///         - Real Aave V3 integration (Base Sepolia deployment)
 ///         - Real Morpho Blue integration (direct market supply)
-///         - CRE forwarder configured
-///         - LCR floor set
 ///
 /// @dev Run with:
 ///   source .env
@@ -24,7 +22,6 @@ contract DeployBaseSepolia is Script {
     address constant USDC = 0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f;
     address constant AAVE_POOL = 0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27;
     address constant AAVE_AUSDC = 0x10F1A9D11CDf50041f3f8cB7191CBE2f31750ACC;
-    address constant CRE_FORWARDER = 0x82300bd7c3958625581cc2F77bC6464dcEcDF3e5;
 
     // Morpho Blue core — deterministic CREATE2 address (same on all chains)
     address constant MORPHO_BLUE = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
@@ -55,19 +52,18 @@ contract DeployBaseSepolia is Script {
                 deployer, // feeRecipient = deployer for testnet
                 1_000, // 10% performance fee
                 200, // 2% annual management fee
-                3_600, // 1 hour EMA smoothing
                 "StreamVault USDC (Base Sepolia)",
                 "svUSDC"
             )
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
         StreamVault vault = StreamVault(address(proxy));
-        console.log("[1/8] StreamVault implementation:", address(implementation));
-        console.log("[1/8] StreamVault proxy:", address(vault));
+        console.log("[1/6] StreamVault implementation:", address(implementation));
+        console.log("[1/6] StreamVault proxy:", address(vault));
 
         // ─── 2. Deploy AaveV3YieldSource ─────────────────────────────────
         AaveV3YieldSource aaveSource = new AaveV3YieldSource(USDC, AAVE_POOL, AAVE_AUSDC, address(vault));
-        console.log("[2/8] AaveV3YieldSource deployed:", address(aaveSource));
+        console.log("[2/6] AaveV3YieldSource deployed:", address(aaveSource));
 
         // ─── 3. Create Morpho Blue Market ────────────────────────────────
         // LLTV=0 and IRM=address(0) are both enabled by default in Morpho Blue.
@@ -78,30 +74,21 @@ contract DeployBaseSepolia is Script {
 
         // createMarket reverts if the market already exists, so wrap in try-catch
         try IMorphoBlue(MORPHO_BLUE).createMarket(morphoMarketParams) {
-            console.log("[3/8] Morpho Blue market created");
+            console.log("[3/6] Morpho Blue market created");
         } catch {
-            console.log("[3/8] Morpho Blue market already exists");
+            console.log("[3/6] Morpho Blue market already exists");
         }
 
         // ─── 4. Deploy MorphoBlueYieldSource ─────────────────────────────
         MorphoBlueYieldSource morphoSource = new MorphoBlueYieldSource(MORPHO_BLUE, morphoMarketParams, address(vault));
-        console.log("[4/8] MorphoBlueYieldSource deployed:", address(morphoSource));
+        console.log("[4/6] MorphoBlueYieldSource deployed:", address(morphoSource));
 
         // ─── 5. Register yield sources ───────────────────────────────────
         vault.addYieldSource(IYieldSource(address(aaveSource)));
-        console.log("[5/8] Aave source registered");
+        console.log("[5/6] Aave source registered");
 
         vault.addYieldSource(IYieldSource(address(morphoSource)));
-        console.log("[6/8] Morpho Blue source registered");
-
-        // ─── 6. Configure CRE ────────────────────────────────────────────
-        // For testnet: set deployer as forwarder so we can simulate CRE reports
-        vault.setChainlinkForwarder(deployer);
-        console.log("[7/8] CRE Forwarder set to deployer (for testing)");
-
-        // Set LCR floor at 120%
-        vault.setLCRFloor(12_000);
-        console.log("[8/8] LCR floor set to 120% (12000 bps)");
+        console.log("[6/6] Morpho Blue source registered");
 
         vm.stopBroadcast();
 

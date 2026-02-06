@@ -21,7 +21,6 @@ import {MorphoBlueYieldSource, MarketParams} from "../src/MorphoBlueYieldSource.
 /// Optional environment variables:
 ///   PERFORMANCE_FEE_BPS  - Performance fee in bps (default: 1000 = 10%)
 ///   MANAGEMENT_FEE_BPS   - Annual management fee in bps (default: 200 = 2%)
-///   SMOOTHING_PERIOD     - EMA smoothing period in seconds (default: 3600 = 1 hour)
 ///   VAULT_NAME           - ERC-20 name (default: "StreamVault")
 ///   VAULT_SYMBOL         - ERC-20 symbol (default: "svTOKEN")
 ///
@@ -48,7 +47,6 @@ contract DeployStreamVault is Script {
 
         uint256 performanceFeeBps = vm.envOr("PERFORMANCE_FEE_BPS", uint256(1_000));
         uint256 managementFeeBps = vm.envOr("MANAGEMENT_FEE_BPS", uint256(200));
-        uint256 smoothingPeriod = vm.envOr("SMOOTHING_PERIOD", uint256(3_600));
 
         string memory vaultName = vm.envOr("VAULT_NAME", string("StreamVault"));
         string memory vaultSymbol = vm.envOr("VAULT_SYMBOL", string("svTOKEN"));
@@ -60,7 +58,6 @@ contract DeployStreamVault is Script {
         console.log("Fee Recipient:", feeRecipient);
         console.log("Performance Fee (bps):", performanceFeeBps);
         console.log("Management Fee (bps):", managementFeeBps);
-        console.log("Smoothing Period (s):", smoothingPeriod);
 
         // ─── Deploy Vault ───────────────────────────────────────────────────
 
@@ -73,16 +70,7 @@ contract DeployStreamVault is Script {
         // Deploy UUPS proxy with initialize calldata
         bytes memory initData = abi.encodeCall(
             StreamVault.initialize,
-            (
-                IERC20(asset),
-                operatorAddr,
-                feeRecipient,
-                performanceFeeBps,
-                managementFeeBps,
-                smoothingPeriod,
-                vaultName,
-                vaultSymbol
-            )
+            (IERC20(asset), operatorAddr, feeRecipient, performanceFeeBps, managementFeeBps, vaultName, vaultSymbol)
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
         StreamVault vault = StreamVault(address(proxy));
@@ -155,7 +143,7 @@ contract DeploySepolia is Script {
         StreamVault implementation = new StreamVault();
         bytes memory initData = abi.encodeCall(
             StreamVault.initialize,
-            (IERC20(usdc), operatorAddr, operatorAddr, 1_000, 200, 3_600, "StreamVault USDC (Sepolia)", "svUSDC")
+            (IERC20(usdc), operatorAddr, operatorAddr, 1_000, 200, "StreamVault USDC (Sepolia)", "svUSDC")
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
         StreamVault vault = StreamVault(address(proxy));

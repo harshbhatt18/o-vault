@@ -6,7 +6,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 /// @title FeeLib
 /// @notice Pure fee calculation helpers used by StreamVault.
 /// @dev Extracted from StreamVault for separation of concerns and readability.
-///      All functions are `internal pure/view` — no storage access, no side effects.
+///      All functions are `internal pure` — no storage access, no side effects.
 library FeeLib {
     using Math for uint256;
 
@@ -45,20 +45,37 @@ library FeeLib {
         fee = payout.mulDiv(feeBps, BPS, Math.Rounding.Floor);
     }
 
-    /// @notice Convert assets to shares using EMA-based NAV.
-    /// @dev Mirrors OZ _convertToShares but substitutes emaTotalAssets for totalAssets().
+    /// @notice Convert assets to shares using spot NAV.
+    /// @dev Mirrors OZ _convertToShares logic.
     /// @param assets Amount of assets to convert.
     /// @param totalSupply Current share supply.
-    /// @param emaTotalAssets EMA-smoothed total assets.
+    /// @param totalAssets Current total assets (spot value).
     /// @param decimalsOffset Virtual share offset exponent.
     /// @return shares Equivalent share amount.
-    function convertToSharesAtEma(uint256 assets, uint256 totalSupply, uint256 emaTotalAssets, uint8 decimalsOffset)
+    function convertToShares(uint256 assets, uint256 totalSupply, uint256 totalAssets, uint8 decimalsOffset)
         internal
         pure
         returns (uint256 shares)
     {
         return (assets == 0 || totalSupply == 0)
             ? assets.mulDiv(10 ** decimalsOffset, 1, Math.Rounding.Floor)
-            : assets.mulDiv(totalSupply + 10 ** decimalsOffset, emaTotalAssets + 1, Math.Rounding.Floor);
+            : assets.mulDiv(totalSupply + 10 ** decimalsOffset, totalAssets + 1, Math.Rounding.Floor);
+    }
+
+    /// @notice Convert shares to assets using spot NAV.
+    /// @dev Mirrors OZ _convertToAssets logic.
+    /// @param shares Amount of shares to convert.
+    /// @param totalSupply Current share supply.
+    /// @param totalAssets Current total assets (spot value).
+    /// @param decimalsOffset Virtual share offset exponent.
+    /// @return assets Equivalent asset amount.
+    function convertToAssets(uint256 shares, uint256 totalSupply, uint256 totalAssets, uint8 decimalsOffset)
+        internal
+        pure
+        returns (uint256 assets)
+    {
+        return (shares == 0 || totalSupply == 0)
+            ? shares.mulDiv(1, 10 ** decimalsOffset, Math.Rounding.Floor)
+            : shares.mulDiv(totalAssets + 1, totalSupply + 10 ** decimalsOffset, Math.Rounding.Floor);
     }
 }

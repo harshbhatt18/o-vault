@@ -13,20 +13,18 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import {IYieldSource} from "./IYieldSource.sol";
-import {IReceiver} from "./interfaces/IReceiver.sol";
 import {Multicall} from "@openzeppelin/contracts/utils/Multicall.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {IERC7540Redeem, IERC7540Operator} from "./interfaces/IERC7540.sol";
-import {RiskModel} from "./libraries/RiskModel.sol";
 import {FeeLib} from "./libraries/FeeLib.sol";
+import {IComplianceRouter} from "./compliance/IComplianceRouter.sol";
 
 /// @title StreamVault
 /// @notice UUPS-upgradeable ERC-4626 vault with async (epoch-based) withdrawals, multi-connector
-///         yield sources, EMA-smoothed NAV for manipulation-resistant settlement, and continuous
-///         management fee accrual. Deposits are instant. Withdrawals go through a three-step process:
+///         yield sources, compliance module integration, and continuous management fee accrual.
+///         Deposits are instant. Withdrawals go through a three-step process:
 ///         requestWithdraw → settleEpoch → claimWithdrawal.
-///         Implements IReceiver for Chainlink CRE risk oracle integration.
 contract StreamVault is
     Initializable,
     ERC4626Upgradeable,
@@ -35,7 +33,6 @@ contract StreamVault is
     UUPSUpgradeable,
     EIP712,
     Multicall,
-    IReceiver,
     IERC7540Redeem
 {
     using SafeERC20 for IERC20;
@@ -47,9 +44,6 @@ contract StreamVault is
     uint256 public constant MAX_YIELD_SOURCES = 20;
     uint256 public constant MAX_PERFORMANCE_FEE_BPS = 5_000; // 50%
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 500; // 5% annual
-    uint256 public constant MIN_SMOOTHING_PERIOD = 300; // 5 minutes
-    uint256 public constant MAX_SMOOTHING_PERIOD = 86_400; // 24 hours
-    uint256 public constant EMA_FLOOR_BPS = 9_500; // EMA >= 95% of spot
     uint256 public constant SECONDS_PER_YEAR = 365.25 days; // 31_557_600
     uint256 public constant MIN_EPOCH_DURATION = 300; // 5 minutes — prevents settlement timing attacks
     uint256 public constant MAX_DRAWDOWN_BPS = 5_000; // Max configurable drawdown: 50%
@@ -60,11 +54,9 @@ contract StreamVault is
     uint256 public constant MAX_TIMELOCK_DELAY = 7 days;
 
     // ─── RBAC Role Constants ────────────────────────────────────────────
-    /// @notice Role for emergency pause/unpause (guardian).
     bytes32 public constant ROLE_GUARDIAN = keccak256("ROLE_GUARDIAN");
 
     // ─── EIP-712 Typehash ──────────────────────────────────────────────
-    /// @dev EIP-712 typehash for setOperatorWithSig.
     bytes32 public constant SET_OPERATOR_TYPEHASH =
         keccak256("SetOperator(address owner,address operator,bool approved,uint256 nonce,uint256 deadline)");
 
@@ -77,87 +69,73 @@ contract StreamVault is
 
     struct Epoch {
         EpochStatus status;
-        uint256 totalSharesBurned; // shares burned by all requestors in this epoch
-        uint256 totalAssetsOwed; // USDC owed to all requestors (set at settlement)
-        uint256 totalAssetsClaimed; // USDC already claimed
+        uint256 totalSharesBurned;
+        uint256 totalAssetsOwed;
+        uint256 totalAssetsClaimed;
     }
 
     struct WithdrawRequest {
-        uint256 shares; // shares burned by this user in this epoch
+        uint256 shares;
     }
 
     struct TimelockOp {
-        uint256 readyAt; // timestamp when executable (0 = not scheduled)
-        bytes32 dataHash; // keccak256 of the calldata for verification
+        uint256 readyAt;
+        bytes32 dataHash;
     }
 
     // ─── State ──────────────────────────────────────────────────────────
 
     IYieldSource[] public yieldSources;
     address public operator;
-    address public pendingOperator; // 2-step operator transfer
+    address public pendingOperator;
     address public feeRecipient;
-    uint256 public performanceFeeBps; // e.g. 1000 = 10%, set once in initialize()
+    uint256 public performanceFeeBps;
 
     uint256 public currentEpochId;
-    uint256 public totalPendingShares; // shares burned but not yet settled
-    uint256 public totalClaimableAssets; // USDC owed in settled epochs, not yet claimed
+    uint256 public totalPendingShares;
+    uint256 public totalClaimableAssets;
 
-    mapping(uint256 => uint256) public lastHarvestedBalance; // per-source high water mark
+    mapping(uint256 => uint256) public lastHarvestedBalance;
 
     // ─── Management Fee State ───────────────────────────────────────────
 
-    uint256 public managementFeeBps; // annual fee in bps (e.g. 200 = 2%)
+    uint256 public managementFeeBps;
     uint256 public lastFeeAccrualTimestamp;
 
-    // ─── EMA State ──────────────────────────────────────────────────────
+    // ─── Epoch Timing ───────────────────────────────────────────────────
 
-    uint256 public emaTotalAssets; // smoothed NAV — used by settleEpoch
-    uint256 public lastEmaUpdateTimestamp;
-    uint256 public smoothingPeriod; // seconds for full convergence
-    uint256 public epochOpenedAt; // timestamp when current epoch started
+    uint256 public epochOpenedAt;
 
     // ─── Drawdown Protection State ───────────────────────────────────────
 
-    uint256 public navHighWaterMark; // highest NAV per share (18 decimals)
-    uint256 public maxDrawdownBps; // max allowed drawdown before auto-pause (e.g., 1000 = 10%)
+    uint256 public navHighWaterMark;
+    uint256 public maxDrawdownBps;
 
-    // ─── CRE Risk Oracle State ──────────────────────────────────────────
+    // ─── Compliance Module ──────────────────────────────────────────────
 
-    address public chainlinkForwarder; // Chainlink CRE KeystoneForwarder address
-    RiskModel.RiskSnapshot public latestRiskSnapshot; // Latest risk snapshot from CRE
-    uint256 public lcrFloorBps; // Minimum LCR (e.g., 10000 = 100%), enforced in deployToYield()
-
-    /// @notice Action type constants for onReport dispatch
-    uint8 public constant ACTION_UPDATE_RISK_PARAMS = 0;
-    uint8 public constant ACTION_DEFENSIVE_REBALANCE = 1;
-    uint8 public constant ACTION_EMERGENCY_PAUSE = 2;
-    uint8 public constant ACTION_SETTLE_EPOCH = 3;
-    uint8 public constant ACTION_HARVEST_YIELD = 4;
+    IComplianceRouter public complianceRouter;
 
     // ─── Mappings ───────────────────────────────────────────────────────
 
     mapping(uint256 => Epoch) public epochs;
     mapping(uint256 => mapping(address => WithdrawRequest)) public withdrawRequests;
-    mapping(address => RiskModel.SourceRiskParams) public sourceRiskParams; // source address → CRE risk params
-    mapping(address => bool) public isRegisteredSource; // source address → is registered
 
     // ─── Feature: Deposit Cap ─────────────────────────────────────────────
 
-    uint256 public depositCap; // 0 = unlimited
+    uint256 public depositCap;
 
     // ─── Feature: Timelock ────────────────────────────────────────────────
 
-    uint256 public timelockDelay; // 0 = disabled, otherwise [MIN_TIMELOCK_DELAY, MAX_TIMELOCK_DELAY]
+    uint256 public timelockDelay;
     mapping(bytes32 => TimelockOp) public timelockOps;
 
     // ─── Feature: Withdrawal Fee ──────────────────────────────────────────
 
-    uint256 public withdrawalFeeBps; // exit fee in bps (max MAX_WITHDRAWAL_FEE_BPS)
+    uint256 public withdrawalFeeBps;
 
     // ─── Feature: Deposit Lockup ──────────────────────────────────────────
 
-    uint256 public lockupPeriod; // seconds, 0 = disabled
+    uint256 public lockupPeriod;
     mapping(address => uint256) public depositTimestamp;
 
     // ─── Feature: Transfer Restrictions ───────────────────────────────────
@@ -174,17 +152,14 @@ contract StreamVault is
     mapping(address => mapping(address => bool)) private _isOperator7540;
 
     // ─── Feature: RBAC ─────────────────────────────────────────────────
-    /// @dev Role bitmap: operator implicitly has all roles; additional addresses can be granted specific roles.
     mapping(bytes32 => mapping(address => bool)) private _roles;
 
     // ─── Feature: EIP-712 Nonces ───────────────────────────────────────
-    /// @dev Per-user nonces for EIP-712 signature replay protection.
     mapping(address => uint256) public nonces;
 
     // ─── Storage Gap ─────────────────────────────────────────────────────
 
-    /// @dev Reserved storage slots for future upgrades.
-    uint256[42] private __gap;
+    uint256[40] private __gap;
 
     // ─── Events ─────────────────────────────────────────────────────────
 
@@ -197,23 +172,15 @@ contract StreamVault is
     event YieldSourceAdded(uint256 indexed sourceIndex, address indexed source);
     event YieldSourceRemoved(uint256 indexed sourceIndex, address indexed source);
     event ManagementFeeAccrued(uint256 feeAssets, uint256 feeShares, uint256 elapsed);
-    event EmaUpdated(uint256 newEma, uint256 spot);
     event OperatorTransferRequested(address indexed currentOperator, address indexed pendingOperator);
     event OperatorUpdated(address indexed newOperator);
     event FeeRecipientUpdated(address indexed newFeeRecipient);
     event ManagementFeeUpdated(uint256 newFeeBps);
-    event SmoothingPeriodUpdated(uint256 newPeriod);
     event VaultPaused(address indexed by);
     event VaultUnpaused(address indexed by);
     event DrawdownCircuitBreaker(uint256 currentNav, uint256 highWaterMark, uint256 drawdownBps);
     event NavHighWaterMarkUpdated(uint256 newHighWaterMark);
     event MaxDrawdownUpdated(uint256 newMaxDrawdownBps);
-    event ChainlinkForwarderUpdated(address indexed forwarder);
-    event RiskParamsUpdated(address indexed source, RiskModel.SourceRiskParams params);
-    event RiskSnapshotUpdated(RiskModel.RiskSnapshot snapshot);
-    event DefensiveRebalanceTriggered(address indexed source, uint256 amountWithdrawn);
-    event EmergencyPauseTriggered(uint8 severity);
-    event LCRFloorUpdated(uint256 newFloorBps);
     event DepositCapUpdated(uint256 newCap);
     event WithdrawalFeeUpdated(uint256 newFeeBps);
     event WithdrawalFeePaid(address indexed user, uint256 feeAmount, address indexed feeRecipient);
@@ -227,11 +194,11 @@ contract StreamVault is
     event RoleGranted(bytes32 indexed role, address indexed account);
     event RoleRevoked(bytes32 indexed role, address indexed account);
     event TokenRescued(address indexed token, address indexed to, uint256 amount);
+    event ComplianceRouterUpdated(address indexed router);
 
     // ─── Errors ─────────────────────────────────────────────────────────
 
     error OnlyOperator();
-    error OnlyOperatorOrCRE();
     error EpochNotSettled();
     error EpochAlreadySettled();
     error NoRequestInEpoch();
@@ -244,17 +211,9 @@ contract StreamVault is
     error InsufficientLiquidity();
     error TooManyYieldSources();
     error FeeTooHigh();
-    error InvalidSmoothingPeriod();
     error EpochTooYoung();
     error InvalidDrawdownThreshold();
-    error OnlyForwarder();
-    error InvalidAction(uint8 action);
     error ArrayLengthMismatch();
-    error UnknownSource(address source);
-    error HaircutTooHigh();
-    error InvalidConcentration();
-    error LCRBreached(uint256 actual, uint256 floor);
-    error ConcentrationBreached(address source);
     error SyncWithdrawDisabled();
     error OnlyPendingOperator();
     error NoPendingOperator();
@@ -282,13 +241,6 @@ contract StreamVault is
         _;
     }
 
-    /// @notice Allows either the trusted operator or the CRE Forwarder.
-    modifier onlyOperatorOrCRE() {
-        _onlyOperatorOrCRE();
-        _;
-    }
-
-    /// @notice Allows the operator or any address with the given role.
     modifier onlyRole(bytes32 role) {
         if (msg.sender != operator && !_roles[role][msg.sender]) revert OnlyOperator();
         _;
@@ -307,7 +259,6 @@ contract StreamVault is
     /// @param _feeRecipient The address receiving performance and management fees.
     /// @param _performanceFeeBps Performance fee in basis points (e.g., 1000 = 10%).
     /// @param _managementFeeBps Annual management fee in basis points (e.g., 200 = 2%).
-    /// @param _smoothingPeriod EMA smoothing period in seconds.
     /// @param _name ERC-20 share token name.
     /// @param _symbol ERC-20 share token symbol.
     function initialize(
@@ -316,7 +267,6 @@ contract StreamVault is
         address _feeRecipient,
         uint256 _performanceFeeBps,
         uint256 _managementFeeBps,
-        uint256 _smoothingPeriod,
         string memory _name,
         string memory _symbol
     ) external initializer {
@@ -327,36 +277,22 @@ contract StreamVault is
         if (_operator == address(0)) revert ZeroAddress();
         if (_performanceFeeBps > MAX_PERFORMANCE_FEE_BPS) revert FeeTooHigh();
         if (_managementFeeBps > MAX_MANAGEMENT_FEE_BPS) revert FeeTooHigh();
-        if (_smoothingPeriod < MIN_SMOOTHING_PERIOD || _smoothingPeriod > MAX_SMOOTHING_PERIOD) {
-            revert InvalidSmoothingPeriod();
-        }
 
         operator = _operator;
         feeRecipient = _feeRecipient;
         performanceFeeBps = _performanceFeeBps;
         managementFeeBps = _managementFeeBps;
         lastFeeAccrualTimestamp = block.timestamp;
-
-        smoothingPeriod = _smoothingPeriod;
-        emaTotalAssets = 10 ** _decimalsOffset(); // match virtual offset
-        lastEmaUpdateTimestamp = block.timestamp;
         epochOpenedAt = block.timestamp;
 
         // Initialize drawdown protection with default 10% threshold
         maxDrawdownBps = DEFAULT_MAX_DRAWDOWN_BPS;
-        // Initialize HWM to match actual NAV at initialization.
-        // At init: totalSupply() = 0, so navPerShare() returns 1e18.
-        // But after first deposit, NAV depends on asset decimals + decimalsOffset.
-        // For USDC (6 dec) + offset 3: NAV ≈ 1e15, not 1e18.
-        // Set to 0 so the first _checkDrawdown() call sets it to the real NAV.
         navHighWaterMark = 0;
     }
 
     // ─── ERC-4626 Overrides ─────────────────────────────────────────────
 
     /// @notice Total assets under management, excluding assets already owed to settled withdrawers.
-    /// @dev totalAssets = idle balance + sum(yieldSource[i].balance()) − totalClaimableAssets
-    ///      This is the raw "spot" NAV. Settlement uses emaTotalAssets instead.
     function totalAssets() public view override returns (uint256) {
         uint256 idle = IERC20(asset()).balanceOf(address(this));
 
@@ -367,56 +303,46 @@ contract StreamVault is
         }
 
         uint256 gross = idle + deployed;
-        // Claimable should never exceed gross — if it does, yield source rounding
-        // caused a tiny shortfall. Clamp to 0 to prevent revert but this should
-        // only happen for dust amounts.
         if (gross < totalClaimableAssets) return 0;
         return gross - totalClaimableAssets;
     }
 
-    /// @dev Virtual share offset for inflation attack protection (adds 1e3 virtual shares/assets).
+    /// @dev Virtual share offset for inflation attack protection.
     function _decimalsOffset() internal pure override returns (uint8) {
         return 3;
     }
 
-    /// @notice Override to accrue management fee, update EMA, and snap EMA on first deposit.
-    /// @dev Pausing blocks deposits to protect users if a yield source is compromised.
+    /// @notice Override to accrue management fee and run compliance check.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
         override
         nonReentrant
         whenNotPaused
     {
-        _accrueManagementFee();
-        _updateEma();
+        // Compliance check
+        if (address(complianceRouter) != address(0)) {
+            complianceRouter.checkDeposit(address(this), receiver, assets);
+        }
 
-        // Snap EMA to spot after the first real deposit so settlement isn't
-        // priced at the tiny virtual-offset seed value during convergence.
-        bool isFirstDeposit = totalSupply() == 0;
+        _accrueManagementFee();
 
         super._deposit(caller, receiver, assets, shares);
 
         // Track deposit timestamp for lockup enforcement
         depositTimestamp[receiver] = block.timestamp;
-
-        if (isFirstDeposit) {
-            emaTotalAssets = totalAssets();
-            lastEmaUpdateTimestamp = block.timestamp;
-        }
     }
 
-    /// @notice Disable standard ERC-4626 withdraw — all exits go through the epoch queue.
+    /// @notice Disable standard ERC-4626 withdraw.
     function withdraw(uint256, address, address) public pure override returns (uint256) {
         revert SyncWithdrawDisabled();
     }
 
-    /// @notice Disable standard ERC-4626 redeem — all exits go through the epoch queue.
+    /// @notice Disable standard ERC-4626 redeem.
     function redeem(uint256, address, address) public pure override returns (uint256) {
         revert SyncWithdrawDisabled();
     }
 
     /// @notice Returns 0 when paused. Respects deposit cap when set.
-    /// @dev ERC-4626 spec: "MUST return 0 if the Vault is paused or otherwise incapacitated."
     function maxDeposit(address) public view override returns (uint256) {
         if (paused()) return 0;
         if (depositCap == 0) return type(uint256).max;
@@ -425,7 +351,6 @@ contract StreamVault is
     }
 
     /// @notice Returns 0 when paused. Respects deposit cap when set.
-    /// @dev ERC-4626 spec: "MUST return 0 if the Vault is paused or otherwise incapacitated."
     function maxMint(address) public view override returns (uint256) {
         if (paused()) return 0;
         if (depositCap == 0) return type(uint256).max;
@@ -447,10 +372,6 @@ contract StreamVault is
     // ─── Slippage-Protected Deposit Functions ─────────────────────────────
 
     /// @notice Deposit assets with slippage protection.
-    /// @param assets Amount of underlying assets to deposit.
-    /// @param receiver Address to receive the shares.
-    /// @param minSharesOut Minimum shares to receive; reverts if actual shares < minSharesOut.
-    /// @return shares Actual shares minted.
     function depositWithSlippage(uint256 assets, address receiver, uint256 minSharesOut)
         external
         returns (uint256 shares)
@@ -462,10 +383,6 @@ contract StreamVault is
     }
 
     /// @notice Mint exact shares with slippage protection on assets spent.
-    /// @param shares Exact number of shares to mint.
-    /// @param receiver Address to receive the shares.
-    /// @param maxAssetsIn Maximum assets to spend; reverts if actual assets > maxAssetsIn.
-    /// @return assets Actual assets spent.
     function mintWithSlippage(uint256 shares, address receiver, uint256 maxAssetsIn)
         external
         returns (uint256 assets)
@@ -508,7 +425,6 @@ contract StreamVault is
     // ─── Async Withdrawal: Step 1 — Request ────────────────────────────
 
     /// @notice Burn shares and queue a withdrawal request in the current epoch.
-    /// @dev Pausing blocks new withdrawal requests but allows claiming from settled epochs.
     function requestWithdraw(uint256 shares) external nonReentrant whenNotPaused {
         if (shares == 0) revert ZeroShares();
         if (lockupPeriod > 0 && block.timestamp < depositTimestamp[msg.sender] + lockupPeriod) {
@@ -516,7 +432,6 @@ contract StreamVault is
         }
 
         _accrueManagementFee();
-        _updateEma();
 
         _burn(msg.sender, shares);
 
@@ -530,8 +445,7 @@ contract StreamVault is
 
     // ─── Async Withdrawal: Step 2 — Settle ─────────────────────────────
 
-    /// @notice Settle the current epoch using EMA-smoothed NAV for manipulation resistance.
-    ///         Pulls from yield sources (waterfall) if idle funds are insufficient.
+    /// @notice Settle the current epoch using spot NAV.
     function settleEpoch() external onlyOperator nonReentrant {
         _settleCurrentEpoch();
     }
@@ -551,7 +465,7 @@ contract StreamVault is
 
         uint256 payout = userShares.mulDiv(epoch.totalAssetsOwed, epoch.totalSharesBurned, Math.Rounding.Floor);
 
-        // Apply withdrawal fee via FeeLib
+        // Apply withdrawal fee
         uint256 fee;
         if (withdrawalFeeBps > 0 && feeRecipient != address(0)) {
             fee = FeeLib.computeWithdrawalFee(payout, withdrawalFeeBps);
@@ -573,33 +487,15 @@ contract StreamVault is
     // ─── Operator Functions ─────────────────────────────────────────────
 
     /// @notice Deploy idle USDC to a specific yield source.
-    /// @dev Enforces LCR floor and concentration limits using CRE-updated risk params.
     function deployToYield(uint256 sourceIndex, uint256 amount) external onlyOperator nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (sourceIndex >= yieldSources.length) revert InvalidSourceIndex();
 
         _accrueManagementFee();
-        _updateEma();
 
         IYieldSource source = yieldSources[sourceIndex];
         IERC20(asset()).forceApprove(address(source), amount);
         source.deposit(amount);
-
-        // POST-CONDITION: LCR must remain above floor after deployment
-        if (lcrFloorBps > 0) {
-            uint256 lcrAfter = this.computeLCR();
-            if (lcrAfter < lcrFloorBps) revert LCRBreached(lcrAfter, lcrFloorBps);
-        }
-
-        // POST-CONDITION: Concentration limit must not be exceeded
-        RiskModel.SourceRiskParams memory params = sourceRiskParams[address(source)];
-        if (params.maxConcentrationBps > 0) {
-            uint256 sourceBalanceAfter = source.balance();
-            uint256 total = totalAssets();
-            if (RiskModel.isConcentrationBreached(sourceBalanceAfter, total, params.maxConcentrationBps)) {
-                revert ConcentrationBreached(address(source));
-            }
-        }
 
         emit DeployedToYield(sourceIndex, amount);
     }
@@ -610,13 +506,11 @@ contract StreamVault is
         if (sourceIndex >= yieldSources.length) revert InvalidSourceIndex();
 
         _accrueManagementFee();
-        _updateEma();
 
         uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
         yieldSources[sourceIndex].withdraw(amount);
         uint256 balanceAfter = IERC20(asset()).balanceOf(address(this));
 
-        // Verify we received the expected amount (within 1 wei tolerance for rounding)
         uint256 received = balanceAfter - balanceBefore;
         if (received + 1 < amount) {
             revert YieldSourceBalanceMismatch(amount, received);
@@ -625,13 +519,9 @@ contract StreamVault is
         emit WithdrawnFromYield(sourceIndex, amount);
     }
 
-    /// @notice Harvest yield from all sources. Uses per-source high water marks —
-    ///         fees are only charged when a source exceeds its own previous peak.
-    ///         This prevents double-charging on loss recovery: if source B drops
-    ///         and later recovers, the recovery is not counted as new profit.
+    /// @notice Harvest yield from all sources using per-source high water marks.
     function harvestYield() external onlyOperator nonReentrant {
         _accrueManagementFee();
-        _updateEma();
         _checkDrawdown();
 
         uint256 totalProfit;
@@ -641,9 +531,6 @@ contract StreamVault is
             uint256 currentBalance = yieldSources[i].balance();
             uint256 hwm = lastHarvestedBalance[i];
 
-            // Only count profit above each source's own high water mark.
-            // If currentBalance < hwm (loss), don't update HWM — source must
-            // recover past its previous peak before new profit is recognized.
             if (currentBalance > hwm) {
                 totalProfit += currentBalance - hwm;
                 lastHarvestedBalance[i] = currentBalance;
@@ -653,9 +540,7 @@ contract StreamVault is
         if (totalProfit == 0 || performanceFeeBps == 0 || feeRecipient == address(0)) return;
 
         uint256 feeAssets = FeeLib.computePerformanceFee(totalProfit, performanceFeeBps);
-        // Price fee shares using EMA (consistent with settlement pricing).
-        // Using spot would let an inflated spot mint cheaper fee shares.
-        uint256 feeShares = FeeLib.convertToSharesAtEma(feeAssets, totalSupply(), emaTotalAssets, _decimalsOffset());
+        uint256 feeShares = FeeLib.convertToShares(feeAssets, totalSupply(), totalAssets(), _decimalsOffset());
 
         if (feeShares > 0) {
             _mint(feeRecipient, feeShares);
@@ -663,12 +548,9 @@ contract StreamVault is
         }
     }
 
-    // ─── Internal: Management Fee & EMA ─────────────────────────────────
+    // ─── Internal: Management Fee ───────────────────────────────────────
 
     /// @notice Accrue time-proportional management fee via share dilution.
-    /// @dev fee = netAssets × managementFeeBps × elapsed / (SECONDS_PER_YEAR × 10_000)
-    ///      Charged on net AUM (totalAssets, excluding claimable) — fees only apply to
-    ///      assets actually under management, not funds already owed to settled withdrawers.
     function _accrueManagementFee() internal {
         if (managementFeeBps == 0 || feeRecipient == address(0)) return;
 
@@ -688,8 +570,7 @@ contract StreamVault is
 
         if (feeAssets == 0) return;
 
-        // Price fee shares using EMA for consistency with settlement pricing.
-        uint256 feeShares = FeeLib.convertToSharesAtEma(feeAssets, totalSupply(), emaTotalAssets, _decimalsOffset());
+        uint256 feeShares = FeeLib.convertToShares(feeAssets, totalSupply(), netAssets, _decimalsOffset());
 
         if (feeShares > 0) {
             _mint(feeRecipient, feeShares);
@@ -697,74 +578,27 @@ contract StreamVault is
         }
     }
 
-    /// @notice Update the EMA of totalAssets using linear interpolation.
-    /// @dev ema = prev + (spot − prev) × elapsed / smoothingPeriod
-    ///      Fully converges after smoothingPeriod seconds.
-    ///      Floor: EMA cannot be >5% below spot (prevents sandbagging).
-    ///      Safety: EMA never goes below virtual offset (10^3).
-    function _updateEma() internal {
-        uint256 spot = totalAssets();
-        uint256 elapsed = block.timestamp - lastEmaUpdateTimestamp;
-
-        if (elapsed == 0) return;
-
-        if (elapsed >= smoothingPeriod) {
-            emaTotalAssets = spot;
-        } else {
-            if (spot > emaTotalAssets) {
-                uint256 delta = spot - emaTotalAssets;
-                emaTotalAssets += delta.mulDiv(elapsed, smoothingPeriod, Math.Rounding.Floor);
-            } else if (spot < emaTotalAssets) {
-                uint256 delta = emaTotalAssets - spot;
-                emaTotalAssets -= delta.mulDiv(elapsed, smoothingPeriod, Math.Rounding.Floor);
-            }
-        }
-
-        // Floor: EMA cannot be more than 5% below spot
-        uint256 floor = spot.mulDiv(EMA_FLOOR_BPS, 10_000, Math.Rounding.Floor);
-        if (emaTotalAssets < floor) {
-            emaTotalAssets = floor;
-        }
-
-        // Safety: never below virtual offset
-        uint256 minEma = 10 ** _decimalsOffset();
-        if (emaTotalAssets < minEma) {
-            emaTotalAssets = minEma;
-        }
-
-        lastEmaUpdateTimestamp = block.timestamp;
-
-        emit EmaUpdated(emaTotalAssets, spot);
-    }
-
     /// @notice Calculate the current NAV per share in 18-decimal precision.
-    /// @dev Uses EMA-based NAV for manipulation resistance.
     function navPerShare() public view returns (uint256) {
         uint256 supply = totalSupply();
         if (supply == 0) return 1e18;
-        // Use EMA for consistent pricing with settlement
-        return emaTotalAssets.mulDiv(1e18, supply, Math.Rounding.Floor);
+        return totalAssets().mulDiv(1e18, supply, Math.Rounding.Floor);
     }
 
     /// @notice Check for excessive drawdown and auto-pause if threshold exceeded.
-    /// @dev Updates high water mark if NAV is at new high.
-    ///      Triggers circuit breaker if drawdown exceeds maxDrawdownBps.
     function _checkDrawdown() internal {
-        if (maxDrawdownBps == 0) return; // Drawdown protection disabled
+        if (maxDrawdownBps == 0) return;
 
         uint256 currentNav = navPerShare();
 
-        // Update high water mark if at new high
         if (currentNav > navHighWaterMark) {
             navHighWaterMark = currentNav;
             emit NavHighWaterMarkUpdated(currentNav);
             return;
         }
 
-        // Calculate drawdown from high water mark
         uint256 drawdownBps = ((navHighWaterMark - currentNav) * 10_000) / navHighWaterMark;
 
-        // Trigger circuit breaker if drawdown exceeds threshold
         if (drawdownBps >= maxDrawdownBps && !paused()) {
             _pause();
             emit DrawdownCircuitBreaker(currentNav, navHighWaterMark, drawdownBps);
@@ -775,7 +609,6 @@ contract StreamVault is
     // ─── Batch Operations ─────────────────────────────────────────────
 
     /// @notice Claim withdrawals from multiple settled epochs in a single transaction.
-    /// @param epochIds Array of epoch IDs to claim from.
     function batchClaimWithdrawals(uint256[] calldata epochIds) external nonReentrant {
         uint256 len = epochIds.length;
         uint256 totalPayout;
@@ -794,7 +627,6 @@ contract StreamVault is
 
             uint256 payout = userShares.mulDiv(epoch.totalAssetsOwed, epoch.totalSharesBurned, Math.Rounding.Floor);
 
-            // Apply withdrawal fee via FeeLib
             uint256 fee;
             if (withdrawalFeeBps > 0 && feeRecipient != address(0)) {
                 fee = FeeLib.computeWithdrawalFee(payout, withdrawalFeeBps);
@@ -819,16 +651,11 @@ contract StreamVault is
     // ─── View Functions ──────────────────────────────────────────────────
 
     /// @notice Get a user's withdraw request for a specific epoch.
-    /// @return shares The number of shares the user burned in this epoch.
     function getUserWithdrawRequest(uint256 epochId, address user) external view returns (uint256 shares) {
         shares = withdrawRequests[epochId][user].shares;
     }
 
     /// @notice Get full epoch info.
-    /// @return status The epoch status (0=OPEN, 1=SETTLED).
-    /// @return totalSharesBurned Total shares burned by all requestors.
-    /// @return totalAssetsOwed Total USDC owed (set at settlement).
-    /// @return totalAssetsClaimed Total USDC already claimed.
     function getEpochInfo(uint256 epochId)
         external
         view
@@ -839,7 +666,6 @@ contract StreamVault is
     }
 
     /// @notice Get the balance of every registered yield source.
-    /// @return balances Array of balances, one per yield source (same order as yieldSources).
     function getAllYieldSourceBalances() external view returns (uint256[] memory balances) {
         uint256 len = yieldSources.length;
         balances = new uint256[](len);
@@ -848,29 +674,13 @@ contract StreamVault is
         }
     }
 
-    /// @notice Current idle balance available for deployment (excluding claimable).
+    /// @notice Current idle balance available for deployment.
     function idleBalance() external view returns (uint256) {
         uint256 idle = IERC20(asset()).balanceOf(address(this));
         return idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
     }
 
-    // ─── CRE View Functions ─────────────────────────────────────────────
-
-    /// @notice Returns deployed balance for a specific yield source by address.
-    /// @param source The yield source address.
-    /// @return balance The current balance deployed to this source.
-    function getSourceBalance(address source) external view returns (uint256 balance) {
-        uint256 len = yieldSources.length;
-        for (uint256 i; i < len; ++i) {
-            if (address(yieldSources[i]) == source) {
-                return yieldSources[i].balance();
-            }
-        }
-        return 0;
-    }
-
     /// @notice Returns all registered yield source addresses.
-    /// @return sources Array of yield source addresses.
     function getYieldSources() external view returns (address[] memory sources) {
         uint256 len = yieldSources.length;
         sources = new address[](len);
@@ -879,76 +689,21 @@ contract StreamVault is
         }
     }
 
-    /// @notice Returns current risk parameters for a source.
-    /// @param source The yield source address.
-    /// @return params The source's CRE-updated risk parameters.
-    function getSourceRiskParams(address source) external view returns (RiskModel.SourceRiskParams memory params) {
-        params = sourceRiskParams[source];
-    }
-
-    /// @notice Returns the latest risk snapshot from CRE.
-    /// @return snapshot The most recent risk snapshot.
-    function getLatestRiskSnapshot() external view returns (RiskModel.RiskSnapshot memory snapshot) {
-        snapshot = latestRiskSnapshot;
-    }
-
     /// @notice Returns pending withdrawal amount for current epoch.
-    /// @return pending Total shares pending settlement in current epoch.
     function getPendingEpochWithdrawals() external view returns (uint256 pending) {
         pending = epochs[currentEpochId].totalSharesBurned;
     }
 
     /// @notice Returns epoch timing info.
-    /// @return epochId Current epoch ID.
-    /// @return startTime When current epoch started.
-    /// @return minDuration Minimum epoch duration before settlement.
     function getCurrentEpochInfo() external view returns (uint256 epochId, uint256 startTime, uint256 minDuration) {
         epochId = currentEpochId;
         startTime = epochOpenedAt;
         minDuration = MIN_EPOCH_DURATION;
     }
 
-    /// @notice Computes current on-chain LCR using stored risk params.
-    /// @dev HQLA = Σ(sourceBalance * (10000 - haircutBps)) / 10000 + idleBalance
-    ///      Outflows = Σ(sourceBalance * stressOutflowBps) / 10000 + pendingWithdrawals
-    ///      LCR = HQLA * 10000 / Outflows
-    /// @return lcrBps The LCR in basis points (10000 = 100%).
-    function computeLCR() external view returns (uint256 lcrBps) {
-        uint256 len = yieldSources.length;
-        uint256 totalHQLA;
-        uint256 totalStressedOutflows;
-
-        for (uint256 i; i < len; ++i) {
-            address sourceAddr = address(yieldSources[i]);
-            uint256 bal = yieldSources[i].balance();
-            RiskModel.SourceRiskParams memory params = sourceRiskParams[sourceAddr];
-
-            // HQLA contribution = balance * (1 - haircut)
-            totalHQLA += RiskModel.computeSourceHQLA(bal, params.liquidityHaircutBps);
-            // Stressed outflow contribution
-            totalStressedOutflows += RiskModel.computeSourceStressedOutflow(bal, params.stressOutflowBps);
-        }
-
-        // Add idle balance (no haircut on idle)
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
-        uint256 availableIdle = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
-        totalHQLA += availableIdle;
-
-        // Add pending withdrawals to outflows
-        totalStressedOutflows += epochs[currentEpochId].totalSharesBurned;
-
-        // Compute LCR (avoid division by zero)
-        if (totalStressedOutflows == 0) {
-            return type(uint256).max; // Infinite LCR if no outflows
-        }
-
-        lcrBps = (totalHQLA * RiskModel.BPS) / totalStressedOutflows;
-    }
-
     // ─── Admin Functions ────────────────────────────────────────────────
 
     /// @notice Propose a new operator (step 1 of 2-step transfer).
-    /// @dev The pending operator must call acceptOperator() to complete the transfer.
     function transferOperator(address _pendingOperator) external onlyOperator {
         if (_pendingOperator == address(0)) revert ZeroAddress();
         pendingOperator = _pendingOperator;
@@ -956,7 +711,6 @@ contract StreamVault is
     }
 
     /// @notice Accept the operator role (step 2 of 2-step transfer).
-    /// @dev Only the pending operator can call this.
     function acceptOperator() external {
         if (msg.sender != pendingOperator) revert OnlyPendingOperator();
         if (pendingOperator == address(0)) revert NoPendingOperator();
@@ -971,39 +725,25 @@ contract StreamVault is
         emit FeeRecipientUpdated(_feeRecipient);
     }
 
-    /// @notice Update the management fee rate. Accrues at old rate first.
+    /// @notice Update the management fee rate.
     function setManagementFee(uint256 _managementFeeBps) external onlyOperator {
         if (timelockDelay > 0) revert TimelockRequired();
         _setManagementFeeInternal(_managementFeeBps);
     }
 
-    /// @notice Update the EMA smoothing period.
-    function setSmoothingPeriod(uint256 _smoothingPeriod) external onlyOperator {
-        if (_smoothingPeriod < MIN_SMOOTHING_PERIOD || _smoothingPeriod > MAX_SMOOTHING_PERIOD) {
-            revert InvalidSmoothingPeriod();
-        }
-        smoothingPeriod = _smoothingPeriod;
-        emit SmoothingPeriodUpdated(_smoothingPeriod);
-    }
-
     /// @notice Pause deposits and new withdrawal requests.
-    /// @dev Use in emergencies (e.g., yield source exploit, oracle failure).
-    ///      Claims from settled epochs remain available — users can always exit.
-    ///      Callable by operator or any address with ROLE_GUARDIAN.
     function pause() external onlyRole(ROLE_GUARDIAN) {
         _pause();
         emit VaultPaused(msg.sender);
     }
 
     /// @notice Resume normal operations after pause.
-    /// @dev Callable by operator or any address with ROLE_GUARDIAN.
     function unpause() external onlyRole(ROLE_GUARDIAN) {
         _unpause();
         emit VaultUnpaused(msg.sender);
     }
 
     /// @notice Update the max drawdown threshold.
-    /// @param _maxDrawdownBps New threshold in basis points (e.g., 1000 = 10%). Set to 0 to disable.
     function setMaxDrawdown(uint256 _maxDrawdownBps) external onlyOperator {
         if (_maxDrawdownBps > MAX_DRAWDOWN_BPS) revert InvalidDrawdownThreshold();
         maxDrawdownBps = _maxDrawdownBps;
@@ -1011,28 +751,16 @@ contract StreamVault is
     }
 
     /// @notice Reset the NAV high water mark to current NAV.
-    /// @dev Use after recovering from a drawdown event and resuming operations.
-    ///      This prevents the vault from immediately re-triggering the circuit breaker.
     function resetNavHighWaterMark() external onlyOperator {
         uint256 currentNav = navPerShare();
         navHighWaterMark = currentNav;
         emit NavHighWaterMarkUpdated(currentNav);
     }
 
-    /// @notice Set the Chainlink CRE Forwarder address.
-    /// @dev Only callable by operator. The Forwarder is the only address that can call onReport().
-    /// @param forwarder The KeystoneForwarder contract address for this network.
-    function setChainlinkForwarder(address forwarder) external onlyOperator {
-        if (forwarder == address(0)) revert ZeroAddress();
-        chainlinkForwarder = forwarder;
-        emit ChainlinkForwarderUpdated(forwarder);
-    }
-
-    /// @notice Set the minimum LCR floor for deployment operations.
-    /// @param _lcrFloorBps Minimum LCR in basis points (10000 = 100%).
-    function setLCRFloor(uint256 _lcrFloorBps) external onlyOperator {
-        lcrFloorBps = _lcrFloorBps;
-        emit LCRFloorUpdated(_lcrFloorBps);
+    /// @notice Set the compliance router address.
+    function setComplianceRouter(address router) external onlyOperator {
+        complianceRouter = IComplianceRouter(router);
+        emit ComplianceRouterUpdated(router);
     }
 
     // ─── Feature: Deposit Cap ─────────────────────────────────────────────
@@ -1087,7 +815,6 @@ contract StreamVault is
 
     // ─── Feature: Timelock ────────────────────────────────────────────────
 
-    /// @notice Timelock action ID constants.
     bytes32 public constant TIMELOCK_UPGRADE = keccak256("authorizeUpgrade");
     bytes32 public constant TIMELOCK_SET_MGMT_FEE = keccak256("setManagementFee");
     bytes32 public constant TIMELOCK_ADD_YIELD_SOURCE = keccak256("addYieldSource");
@@ -1128,8 +855,7 @@ contract StreamVault is
         emit TimelockCancelled(actionId);
     }
 
-    /// @notice Set the timelock delay. 0 = disabled (direct calls work).
-    /// @dev When timelock is active, changing the delay itself must go through the timelock.
+    /// @notice Set the timelock delay. 0 = disabled.
     function setTimelockDelay(uint256 _delay) external onlyOperator {
         if (timelockDelay > 0) revert TimelockRequired();
         _setTimelockDelayInternal(_delay);
@@ -1150,10 +876,6 @@ contract StreamVault is
     }
 
     /// @notice EIP-7540: Request async redemption.
-    /// @param shares Number of shares to redeem.
-    /// @param controller Address controlling this request (receives claim rights).
-    /// @param owner Source of shares (must be msg.sender or approved 7540 operator).
-    /// @return requestId The epoch ID this request was placed in.
     function requestRedeem(uint256 shares, address controller, address owner)
         external
         nonReentrant
@@ -1169,7 +891,6 @@ contract StreamVault is
         }
 
         _accrueManagementFee();
-        _updateEma();
 
         _burn(owner, shares);
 
@@ -1207,13 +928,11 @@ contract StreamVault is
     /// @notice ERC-165 interface detection.
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
         return interfaceId == type(IERC7540Redeem).interfaceId || interfaceId == type(IERC7540Operator).interfaceId
-            || interfaceId == 0x01ffc9a7; // ERC-165
+            || interfaceId == 0x01ffc9a7;
     }
 
     // ─── UUPS Upgrade Authorization ──────────────────────────────────────
 
-    /// @notice Authorize contract upgrades. Only the operator can upgrade.
-    /// @dev When timelock is active, upgrade must be pre-approved via timelock.
     function _authorizeUpgrade(address newImplementation) internal override onlyOperator {
         if (timelockDelay > 0) {
             if (newImplementation != _pendingUpgradeImpl) revert TimelockNotScheduled();
@@ -1221,114 +940,8 @@ contract StreamVault is
         }
     }
 
-    // ─── CRE Integration: onReport ──────────────────────────────────────
+    // ─── Internal Settlement Logic ───────────────────────────────────────
 
-    /// @notice Called by Chainlink KeystoneForwarder after DON consensus verification.
-    /// @dev The Forwarder has already verified that the DON reached consensus on this report.
-    ///      We only need to verify msg.sender == chainlinkForwarder.
-    ///      First parameter (metadata) is unused but required by IReceiver interface.
-    /// @param report ABI-encoded payload: (uint8 action, bytes actionData).
-    function onReport(
-        bytes calldata,
-        /* metadata */
-        bytes calldata report
-    )
-        external
-        override
-    {
-        if (msg.sender != chainlinkForwarder) revert OnlyForwarder();
-
-        (uint8 action, bytes memory actionData) = abi.decode(report, (uint8, bytes));
-
-        if (action == ACTION_UPDATE_RISK_PARAMS) {
-            _handleUpdateRiskParams(actionData);
-        } else if (action == ACTION_DEFENSIVE_REBALANCE) {
-            _handleDefensiveRebalance(actionData);
-        } else if (action == ACTION_EMERGENCY_PAUSE) {
-            _handleEmergencyPause(actionData);
-        } else if (action == ACTION_SETTLE_EPOCH) {
-            _handleSettleEpoch(actionData);
-        } else if (action == ACTION_HARVEST_YIELD) {
-            _handleHarvestYield(actionData);
-        } else {
-            revert InvalidAction(action);
-        }
-    }
-
-    // ─── CRE Internal Action Handlers ───────────────────────────────────
-
-    /// @dev Decodes and applies new risk parameters from CRE risk model.
-    /// @param actionData Encoding: (address[] sources, SourceRiskParams[] params, RiskSnapshot snapshot).
-    function _handleUpdateRiskParams(bytes memory actionData) internal {
-        (address[] memory sources, RiskModel.SourceRiskParams[] memory params, RiskModel.RiskSnapshot memory snapshot) =
-            abi.decode(actionData, (address[], RiskModel.SourceRiskParams[], RiskModel.RiskSnapshot));
-
-        if (sources.length != params.length) revert ArrayLengthMismatch();
-
-        for (uint256 i = 0; i < sources.length; i++) {
-            // Validate source is registered
-            if (!isRegisteredSource[sources[i]]) revert UnknownSource(sources[i]);
-
-            // Apply bounds checking on params (prevent CRE from setting absurd values)
-            if (params[i].liquidityHaircutBps > RiskModel.MAX_HAIRCUT_BPS) revert HaircutTooHigh();
-            if (params[i].maxConcentrationBps > uint16(RiskModel.BPS)) revert InvalidConcentration();
-
-            params[i].lastUpdated = uint64(block.timestamp);
-            sourceRiskParams[sources[i]] = params[i];
-            emit RiskParamsUpdated(sources[i], params[i]);
-        }
-
-        latestRiskSnapshot = snapshot;
-        emit RiskSnapshotUpdated(snapshot);
-    }
-
-    /// @dev Pulls capital from a source back to idle (vault holds underlying asset).
-    /// @param actionData Encoding: (address source, uint256 amount).
-    function _handleDefensiveRebalance(bytes memory actionData) internal {
-        (address source, uint256 amount) = abi.decode(actionData, (address, uint256));
-        if (!isRegisteredSource[source]) revert UnknownSource(source);
-
-        // Find source index and withdraw
-        uint256 len = yieldSources.length;
-        for (uint256 i; i < len; ++i) {
-            if (address(yieldSources[i]) == source) {
-                yieldSources[i].withdraw(amount);
-                emit DefensiveRebalanceTriggered(source, amount);
-                return;
-            }
-        }
-    }
-
-    /// @dev Emergency pause — stops deposits and optionally begins unwinding.
-    /// @param actionData Encoding: (uint8 severity).
-    ///        severity 0 = pause deposits only, 1 = pause + begin unwind.
-    function _handleEmergencyPause(bytes memory actionData) internal {
-        (uint8 severity) = abi.decode(actionData, (uint8));
-        _pause();
-        emit EmergencyPauseTriggered(severity);
-        emit VaultPaused(address(this));
-        // NOTE: Unwind logic would go here for severity > 0
-    }
-
-    /// @dev Settles current epoch (same logic as existing settleEpoch).
-    function _handleSettleEpoch(
-        bytes memory /* actionData */
-    )
-        internal
-    {
-        _settleCurrentEpoch();
-    }
-
-    /// @dev Harvests yield from specified sources.
-    /// @param actionData Encoding: (address[] sources).
-    function _handleHarvestYield(bytes memory actionData) internal {
-        (address[] memory sources) = abi.decode(actionData, (address[]));
-        for (uint256 i = 0; i < sources.length; i++) {
-            _harvestFromSource(sources[i]);
-        }
-    }
-
-    /// @dev Internal settlement logic, callable by both settleEpoch() and _handleSettleEpoch().
     function _settleCurrentEpoch() internal {
         uint256 epochId = currentEpochId;
         Epoch storage epoch = epochs[epochId];
@@ -1337,18 +950,15 @@ contract StreamVault is
         if (block.timestamp - epochOpenedAt < MIN_EPOCH_DURATION) revert EpochTooYoung();
 
         _accrueManagementFee();
-        _updateEma();
         _checkDrawdown();
 
         uint256 burnedShares = epoch.totalSharesBurned;
-
-        // Use EMA instead of spot totalAssets for manipulation resistance.
-        uint256 currentTotalAssets = emaTotalAssets;
+        uint256 currentTotalAssets = totalAssets();
         uint256 effectiveSupply = totalSupply() + totalPendingShares;
         uint256 assetsOwed =
             (effectiveSupply > 0) ? burnedShares.mulDiv(currentTotalAssets, effectiveSupply, Math.Rounding.Floor) : 0;
 
-        // Pull from yield sources if idle funds are insufficient (waterfall)
+        // Pull from yield sources if idle funds are insufficient
         uint256 idle = IERC20(asset()).balanceOf(address(this));
         uint256 available = idle > totalClaimableAssets ? idle - totalClaimableAssets : 0;
 
@@ -1365,7 +975,6 @@ contract StreamVault is
                 yieldSources[i].withdraw(pull);
                 uint256 received = IERC20(asset()).balanceOf(address(this)) - balanceBefore;
 
-                // Verify we received the expected amount (within 1 wei tolerance)
                 if (received + 1 < pull) {
                     revert YieldSourceBalanceMismatch(pull, received);
                 }
@@ -1388,81 +997,41 @@ contract StreamVault is
         emit EpochSettled(epochId, assetsOwed);
     }
 
-    /// @dev Internal harvest logic for a single source by address.
-    function _harvestFromSource(address source) internal {
-        uint256 len = yieldSources.length;
-        for (uint256 i; i < len; ++i) {
-            if (address(yieldSources[i]) != source) continue;
+    // ─── Transfer Restrictions (ERC20 hook) ────────────────────────────
 
-            uint256 currentBalance = yieldSources[i].balance();
-            uint256 hwm = lastHarvestedBalance[i];
-
-            if (currentBalance > hwm) {
-                uint256 profit = currentBalance - hwm;
-                lastHarvestedBalance[i] = currentBalance;
-
-                if (profit > 0 && performanceFeeBps > 0 && feeRecipient != address(0)) {
-                    uint256 feeAssets = FeeLib.computePerformanceFee(profit, performanceFeeBps);
-                    uint256 feeShares =
-                        FeeLib.convertToSharesAtEma(feeAssets, totalSupply(), emaTotalAssets, _decimalsOffset());
-
-                    if (feeShares > 0) {
-                        _mint(feeRecipient, feeShares);
-                        emit YieldHarvested(profit, feeShares);
-                    }
-                }
-            }
-            return;
-        }
-    }
-
-    // ─── Feature: Transfer Restrictions (ERC20 hook) ────────────────────
-
-    /// @notice Override ERC20 _update to enforce transfer restrictions on share tokens.
-    /// @dev Only restricts transfers (from != 0 && to != 0). Mints and burns are unrestricted.
     function _update(address from, address to, uint256 value) internal override {
-        if (transfersRestricted && from != address(0) && to != address(0)) {
-            if (!transferWhitelist[to]) revert TransferRestricted();
+        // Compliance check for transfers (not mints/burns)
+        if (from != address(0) && to != address(0)) {
+            if (address(complianceRouter) != address(0)) {
+                complianceRouter.checkTransfer(address(this), from, to, value);
+            }
+
+            if (transfersRestricted && !transferWhitelist[to]) {
+                revert TransferRestricted();
+            }
         }
         super._update(from, to, value);
     }
 
     // ─── Feature: RBAC ───────────────────────────────────────────────────
 
-    /// @notice Grant a role to an address.
-    /// @dev Operator always implicitly has all roles; this grants roles to additional addresses.
-    /// @param role The role identifier (e.g., ROLE_GUARDIAN).
-    /// @param account The address to grant the role to.
     function grantRole(bytes32 role, address account) external onlyOperator {
         if (account == address(0)) revert ZeroAddress();
         _roles[role][account] = true;
         emit RoleGranted(role, account);
     }
 
-    /// @notice Revoke a role from an address.
-    /// @param role The role identifier.
-    /// @param account The address to revoke the role from.
     function revokeRole(bytes32 role, address account) external onlyOperator {
         _roles[role][account] = false;
         emit RoleRevoked(role, account);
     }
 
-    /// @notice Check if an address has a specific role.
-    /// @dev Returns true if `account` is the operator OR has been explicitly granted the role.
-    /// @param role The role identifier.
-    /// @param account The address to check.
-    /// @return True if the account has the role.
     function hasRole(bytes32 role, address account) external view returns (bool) {
         return account == operator || _roles[role][account];
     }
 
     // ─── Feature: Rescuable ─────────────────────────────────────────────
 
-    /// @notice Rescue tokens accidentally sent to this contract.
-    /// @dev Cannot rescue the vault's underlying asset to protect depositor funds.
-    /// @param token The ERC-20 token to rescue.
-    /// @param to The recipient address.
-    /// @param amount The amount to rescue.
     function rescueToken(IERC20 token, address to, uint256 amount) external onlyOperator {
         if (address(token) == asset()) revert RescueUnderlyingForbidden();
         if (to == address(0)) revert ZeroAddress();
@@ -1472,15 +1041,6 @@ contract StreamVault is
 
     // ─── Feature: EIP-712 Gasless Operator Approval ─────────────────────
 
-    /// @notice Set an EIP-7540 operator via EIP-712 signature (gasless approval).
-    /// @dev Allows a relayer to submit the owner's signed approval without the owner paying gas.
-    /// @param signer The address signing the approval (the controller).
-    /// @param _operator The address to approve/revoke as operator.
-    /// @param approved Whether to approve or revoke.
-    /// @param deadline Signature expiry timestamp.
-    /// @param v ECDSA recovery id.
-    /// @param r ECDSA r value.
-    /// @param s ECDSA s value.
     function setOperatorWithSig(
         address signer,
         address _operator,
@@ -1503,8 +1063,6 @@ contract StreamVault is
         emit OperatorSet(signer, _operator, approved);
     }
 
-    /// @notice Returns the EIP-712 domain separator.
-    /// @dev Exposed for off-chain signature construction.
     // solhint-disable-next-line func-name-mixedcase
     function DOMAIN_SEPARATOR() external view returns (bytes32) {
         return _domainSeparatorV4();
@@ -1512,7 +1070,6 @@ contract StreamVault is
 
     // ─── Feature: Timelock Internal ──────────────────────────────────────
 
-    /// @dev Internal dispatcher for timelocked actions. Decodes data and calls the appropriate internal setter.
     function _executeTimelocked(bytes32 actionId, bytes calldata data) internal {
         if (actionId == TIMELOCK_SET_MGMT_FEE) {
             uint256 feeBps = abi.decode(data, (uint256));
@@ -1532,33 +1089,24 @@ contract StreamVault is
         } else if (actionId == TIMELOCK_SET_DELAY) {
             uint256 newDelay = abi.decode(data, (uint256));
             _setTimelockDelayInternal(newDelay);
-        } else {
-            revert InvalidAction(0);
         }
     }
 
-    /// @dev Internal yield source addition. Validates asset match, cap, and registers source with default risk params.
     function _addYieldSourceInternal(IYieldSource source) internal {
         if (address(source) == address(0)) revert ZeroAddress();
         if (source.asset() != asset()) revert AssetMismatch();
         if (yieldSources.length >= MAX_YIELD_SOURCES) revert TooManyYieldSources();
 
         yieldSources.push(source);
-        isRegisteredSource[address(source)] = true;
-        sourceRiskParams[address(source)] = RiskModel.defaultParams();
         emit YieldSourceAdded(yieldSources.length - 1, address(source));
     }
 
-    /// @dev Internal yield source removal. Requires zero balance. Swap-and-pop to avoid gaps.
     function _removeYieldSourceInternal(uint256 sourceIndex) internal {
         uint256 len = yieldSources.length;
         if (sourceIndex >= len) revert InvalidSourceIndex();
 
         IYieldSource source = yieldSources[sourceIndex];
         if (source.balance() != 0) revert SourceNotEmpty();
-
-        isRegisteredSource[address(source)] = false;
-        delete sourceRiskParams[address(source)];
 
         yieldSources[sourceIndex] = yieldSources[len - 1];
         yieldSources.pop();
@@ -1571,7 +1119,6 @@ contract StreamVault is
         emit YieldSourceRemoved(sourceIndex, address(source));
     }
 
-    /// @dev Internal management fee setter. Accrues at old rate before updating.
     function _setManagementFeeInternal(uint256 _managementFeeBps) internal {
         _accrueManagementFee();
         if (_managementFeeBps > MAX_MANAGEMENT_FEE_BPS) revert FeeTooHigh();
@@ -1595,17 +1142,14 @@ contract StreamVault is
 
     // ─── Context Override (diamond resolution) ────────────────────────────
 
-    /// @dev Resolve diamond conflict between ContextUpgradeable and Context (inherited by Multicall).
     function _msgSender() internal view override(ContextUpgradeable, Context) returns (address) {
         return super._msgSender();
     }
 
-    /// @dev Resolve diamond conflict between ContextUpgradeable and Context (inherited by Multicall).
     function _msgData() internal view override(ContextUpgradeable, Context) returns (bytes calldata) {
         return super._msgData();
     }
 
-    /// @dev Resolve diamond conflict between ContextUpgradeable and Context (inherited by Multicall).
     function _contextSuffixLength() internal view override(ContextUpgradeable, Context) returns (uint256) {
         return super._contextSuffixLength();
     }
@@ -1614,9 +1158,5 @@ contract StreamVault is
 
     function _onlyOperator() internal view {
         if (msg.sender != operator) revert OnlyOperator();
-    }
-
-    function _onlyOperatorOrCRE() internal view {
-        if (msg.sender != operator && msg.sender != chainlinkForwarder) revert OnlyOperatorOrCRE();
     }
 }

@@ -30,7 +30,6 @@ abstract contract StreamVaultTestBase is Test {
 
     uint256 internal constant PERF_FEE_BPS = 1_000; // 10%
     uint256 internal constant MGMT_FEE_BPS = 200; // 2% annual
-    uint256 internal constant SMOOTHING = 3_600; // 1 hour
     uint256 internal constant YIELD_RATE = 1; // 0.01% per second for mock
     uint256 internal constant INITIAL_DEPOSIT = 1_000e6; // 1000 USDC (6 decimals)
     uint256 internal constant MIN_EPOCH = 300; // mirrors StreamVault.MIN_EPOCH_DURATION
@@ -44,7 +43,6 @@ abstract contract StreamVaultTestBase is Test {
             feeRecipient,
             PERF_FEE_BPS,
             MGMT_FEE_BPS,
-            SMOOTHING,
             "StreamVault USDC",
             "svUSDC"
         );
@@ -68,13 +66,12 @@ abstract contract StreamVaultTestBase is Test {
         address _feeRecipient,
         uint256 _perfFee,
         uint256 _mgmtFee,
-        uint256 _smoothing,
         string memory _name,
         string memory _symbol
     ) internal returns (StreamVault) {
         StreamVault impl = new StreamVault();
         bytes memory initData = abi.encodeCall(
-            StreamVault.initialize, (_asset, _operator, _feeRecipient, _perfFee, _mgmtFee, _smoothing, _name, _symbol)
+            StreamVault.initialize, (_asset, _operator, _feeRecipient, _perfFee, _mgmtFee, _name, _symbol)
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
         return StreamVault(address(proxy));
@@ -99,9 +96,9 @@ abstract contract StreamVaultTestBase is Test {
         vm.warp(block.timestamp + seconds_);
     }
 
-    /// @dev Warp enough for both EMA convergence and epoch minimum duration.
+    /// @dev Warp enough for epoch minimum duration.
     function _warpForSettle() internal {
-        _warpAndAccrue(SMOOTHING + 1);
+        _warpAndAccrue(MIN_EPOCH + 1);
     }
 }
 
@@ -116,11 +113,9 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
         assertEq(vault.feeRecipient(), feeRecipient);
         assertEq(vault.performanceFeeBps(), PERF_FEE_BPS);
         assertEq(vault.managementFeeBps(), MGMT_FEE_BPS);
-        assertEq(vault.smoothingPeriod(), SMOOTHING);
         assertEq(vault.currentEpochId(), 0);
         assertEq(vault.totalPendingShares(), 0);
         assertEq(vault.totalClaimableAssets(), 0);
-        assertEq(vault.emaTotalAssets(), 10 ** 3); // _decimalsOffset = 3
         assertEq(vault.yieldSourceCount(), 1);
     }
 
@@ -128,7 +123,7 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
         StreamVault impl = new StreamVault();
         bytes memory initData = abi.encodeCall(
             StreamVault.initialize,
-            (IERC20(address(usdc)), address(0), feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V")
+            (IERC20(address(usdc)), address(0), feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, "V", "V")
         );
         vm.expectRevert(StreamVault.ZeroAddress.selector);
         new ERC1967Proxy(address(impl), initData);
@@ -138,7 +133,7 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
         StreamVault impl = new StreamVault();
         bytes memory initData = abi.encodeCall(
             StreamVault.initialize,
-            (IERC20(address(usdc)), operator, feeRecipient, 5_001, MGMT_FEE_BPS, SMOOTHING, "V", "V")
+            (IERC20(address(usdc)), operator, feeRecipient, 5_001, MGMT_FEE_BPS, "V", "V")
         );
         vm.expectRevert(StreamVault.FeeTooHigh.selector);
         new ERC1967Proxy(address(impl), initData);
@@ -148,46 +143,16 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
         StreamVault impl = new StreamVault();
         bytes memory initData = abi.encodeCall(
             StreamVault.initialize,
-            (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 501, SMOOTHING, "V", "V")
+            (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 501, "V", "V")
         );
         vm.expectRevert(StreamVault.FeeTooHigh.selector);
         new ERC1967Proxy(address(impl), initData);
     }
 
-    function test_revert_smoothingTooLow() public {
-        StreamVault impl = new StreamVault();
-        bytes memory initData = abi.encodeCall(
-            StreamVault.initialize,
-            (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 299, "V", "V")
-        );
-        vm.expectRevert(StreamVault.InvalidSmoothingPeriod.selector);
-        new ERC1967Proxy(address(impl), initData);
-    }
-
-    function test_revert_smoothingTooHigh() public {
-        StreamVault impl = new StreamVault();
-        bytes memory initData = abi.encodeCall(
-            StreamVault.initialize,
-            (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 86_401, "V", "V")
-        );
-        vm.expectRevert(StreamVault.InvalidSmoothingPeriod.selector);
-        new ERC1967Proxy(address(impl), initData);
-    }
-
     function test_boundaryValues_perfFeeMax() public {
         StreamVault v =
-            _deployVault(IERC20(address(usdc)), operator, feeRecipient, 5_000, MGMT_FEE_BPS, SMOOTHING, "V", "V");
+            _deployVault(IERC20(address(usdc)), operator, feeRecipient, 5_000, MGMT_FEE_BPS, "V", "V");
         assertEq(v.performanceFeeBps(), 5_000);
-    }
-
-    function test_boundaryValues_smoothingBounds() public {
-        StreamVault vMin =
-            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 300, "V", "V");
-        assertEq(vMin.smoothingPeriod(), 300);
-
-        StreamVault vMax =
-            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, 86_400, "V", "V");
-        assertEq(vMax.smoothingPeriod(), 86_400);
     }
 }
 
@@ -201,12 +166,6 @@ contract StreamVault_Deposit_Test is StreamVaultTestBase {
         assertGt(shares, 0);
         assertEq(vault.balanceOf(alice), shares);
         assertEq(vault.totalAssets(), INITIAL_DEPOSIT);
-    }
-
-    function test_firstDeposit_snapsEmaToSpot() public {
-        _mintAndDeposit(alice, INITIAL_DEPOSIT);
-        // After first deposit, EMA should snap to spot (not stay at virtual 1000)
-        assertEq(vault.emaTotalAssets(), vault.totalAssets());
     }
 
     function test_secondDeposit_proportionalShares() public {
@@ -677,114 +636,7 @@ contract StreamVault_Harvest_Test is StreamVaultTestBase {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. EMA-Smoothed NAV
-// ─────────────────────────────────────────────────────────────────────────────
-
-contract StreamVault_EMA_Test is StreamVaultTestBase {
-    function setUp() public override {
-        super.setUp();
-        _mintAndDeposit(alice, INITIAL_DEPOSIT);
-        _warpForSettle();
-        // Trigger EMA update via a small deposit
-        _mintAndDeposit(bob, 1e6);
-    }
-
-    function test_ema_convergesAfterSmoothingPeriod() public view {
-        uint256 spot = vault.totalAssets();
-        uint256 ema = vault.emaTotalAssets();
-        assertApproxEqRel(ema, spot, 0.02e18);
-    }
-
-    function test_ema_firstDepositSnaps() public {
-        // Deploy a fresh vault
-        StreamVault v2 = _deployVault(
-            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V2", "V2"
-        );
-        assertEq(v2.emaTotalAssets(), 1000); // virtual offset
-
-        usdc.mint(alice, 5_000e6);
-        vm.startPrank(alice);
-        usdc.approve(address(v2), 5_000e6);
-        v2.deposit(5_000e6, alice);
-        vm.stopPrank();
-
-        // EMA should have snapped to spot (5000e6), not stuck at 1000
-        assertEq(v2.emaTotalAssets(), 5_000e6);
-    }
-
-    function test_ema_partialUpdate_movesTowardsSpot() public {
-        uint256 emaBefore = vault.emaTotalAssets();
-
-        usdc.mint(address(vault), 500e6);
-        uint256 newSpot = vault.totalAssets();
-        assertGt(newSpot, emaBefore);
-
-        _warpAndAccrue(SMOOTHING / 2);
-        _mintAndDeposit(carol, 1e6);
-
-        uint256 emaAfter = vault.emaTotalAssets();
-        assertGt(emaAfter, emaBefore);
-        assertLt(emaAfter, newSpot);
-    }
-
-    function test_ema_floorPrevents5PercentDrop() public {
-        usdc.mint(address(vault), 10_000e6);
-
-        _warpAndAccrue(1);
-        uint256 spotBeforeDeposit = vault.totalAssets();
-
-        _mintAndDeposit(carol, 1e6);
-
-        uint256 ema = vault.emaTotalAssets();
-        uint256 floorVal = spotBeforeDeposit * 9_500 / 10_000;
-        assertGe(ema, floorVal);
-        assertLt(ema, vault.totalAssets());
-    }
-
-    function test_ema_donationAttack_limitedImpact() public {
-        uint256 spotBefore = vault.totalAssets();
-        uint256 donation = 1_000e6;
-        usdc.mint(address(vault), donation);
-
-        uint256 spotAfterDonation = vault.totalAssets();
-        assertGt(spotAfterDonation, spotBefore + donation - 1);
-
-        _warpAndAccrue(1);
-        _mintAndDeposit(carol, 1e6);
-
-        uint256 emaAfter = vault.emaTotalAssets();
-        uint256 newSpot = vault.totalAssets();
-        assertLt(emaAfter, newSpot);
-        assertLe(emaAfter, newSpot * 10_000 / 9_500);
-    }
-
-    function test_ema_safetyMinimum() public view {
-        assertGe(vault.emaTotalAssets(), 1_000);
-    }
-
-    function test_settleEpoch_usesEmaNotSpot() public {
-        usdc.mint(address(vault), 5_000e6);
-
-        uint256 shares = vault.balanceOf(alice);
-        vm.prank(alice);
-        vault.requestWithdraw(shares);
-
-        // Wait MIN_EPOCH_DURATION so settlement is allowed
-        _warpAndAccrue(MIN_EPOCH);
-
-        uint256 spotBefore = vault.totalAssets();
-
-        vm.prank(operator);
-        vault.settleEpoch();
-
-        (,, uint256 assetsOwed,) = vault.epochs(0);
-        uint256 spotBased = shares * spotBefore / (vault.totalSupply() + shares);
-        assertLe(assetsOwed, spotBased + 1);
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 7. Continuous Management Fee
+// 6. Continuous Management Fee
 // ─────────────────────────────────────────────────────────────────────────────
 
 contract StreamVault_ManagementFee_Test is StreamVaultTestBase {
@@ -817,7 +669,7 @@ contract StreamVault_ManagementFee_Test is StreamVaultTestBase {
 
     function test_mgmtFee_zeroFee_noAccrual() public {
         StreamVault v2 =
-            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 0, SMOOTHING, "V2", "V2");
+            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 0, "V2", "V2");
 
         usdc.mint(alice, INITIAL_DEPOSIT);
         vm.startPrank(alice);
@@ -948,30 +800,6 @@ contract StreamVault_Admin_Test is StreamVaultTestBase {
         vm.prank(alice);
         vm.expectRevert(StreamVault.OnlyOperator.selector);
         vault.setFeeRecipient(alice);
-    }
-
-    function test_setSmoothingPeriod_success() public {
-        vm.prank(operator);
-        vault.setSmoothingPeriod(600);
-        assertEq(vault.smoothingPeriod(), 600);
-    }
-
-    function test_setSmoothingPeriod_tooLowReverts() public {
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.InvalidSmoothingPeriod.selector);
-        vault.setSmoothingPeriod(100);
-    }
-
-    function test_setSmoothingPeriod_tooHighReverts() public {
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.InvalidSmoothingPeriod.selector);
-        vault.setSmoothingPeriod(100_000);
-    }
-
-    function test_setSmoothingPeriod_onlyOperator() public {
-        vm.prank(alice);
-        vm.expectRevert(StreamVault.OnlyOperator.selector);
-        vault.setSmoothingPeriod(600);
     }
 
     function test_deployToYield_onlyOperator() public {
@@ -1154,25 +982,6 @@ contract StreamVault_Fuzz_Test is StreamVaultTestBase {
         _mintAndDeposit(bob, b);
 
         assertApproxEqAbs(vault.totalAssets(), a + b, 1);
-    }
-
-    function testFuzz_ema_neverBelowFloor(uint256 donation) public {
-        donation = bound(donation, 1e6, 1_000_000_000e6);
-
-        _mintAndDeposit(alice, INITIAL_DEPOSIT);
-        _warpForSettle();
-        _mintAndDeposit(bob, 1e6);
-
-        usdc.mint(address(vault), donation);
-
-        _warpAndAccrue(1);
-        uint256 spotAtUpdate = vault.totalAssets();
-
-        _mintAndDeposit(carol, 1e6);
-
-        uint256 ema = vault.emaTotalAssets();
-        uint256 floor = spotAtUpdate * 9_500 / 10_000;
-        assertGe(ema, floor);
     }
 
     function testFuzz_managementFee_proportionalToTime(uint256 seconds_) public {
@@ -1464,7 +1273,6 @@ contract StreamVault_Upgrade_Test is StreamVaultTestBase {
         uint256 aliceSharesBefore = vault.balanceOf(alice);
         uint256 perfFeeBefore = vault.performanceFeeBps();
         uint256 mgmtFeeBefore = vault.managementFeeBps();
-        uint256 smoothingBefore = vault.smoothingPeriod();
         address operatorBefore = vault.operator();
         uint256 epochBefore = vault.currentEpochId();
 
@@ -1479,7 +1287,6 @@ contract StreamVault_Upgrade_Test is StreamVaultTestBase {
         assertEq(vault.balanceOf(alice), aliceSharesBefore, "alice balance changed");
         assertEq(vault.performanceFeeBps(), perfFeeBefore, "perfFee changed");
         assertEq(vault.managementFeeBps(), mgmtFeeBefore, "mgmtFee changed");
-        assertEq(vault.smoothingPeriod(), smoothingBefore, "smoothing changed");
         assertEq(vault.operator(), operatorBefore, "operator changed");
         assertEq(vault.currentEpochId(), epochBefore, "epoch changed");
     }
@@ -1488,12 +1295,12 @@ contract StreamVault_Upgrade_Test is StreamVaultTestBase {
         StreamVault impl = new StreamVault();
 
         vm.expectRevert();
-        impl.initialize(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V");
+        impl.initialize(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, "V", "V");
     }
 
     function test_proxy_cannotBeReinitialized() public {
         vm.expectRevert();
-        vault.initialize(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, SMOOTHING, "V", "V");
+        vault.initialize(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, "V", "V");
     }
 }
 
