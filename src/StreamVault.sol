@@ -1021,7 +1021,6 @@ contract StreamVault is
         emit WithdrawalFeeUpdated(_withdrawalFeeBps);
     }
 
-
     // ─── Internal Helpers ─────────────────────────────────────────────────
 
     function _onlyOperator() internal view {
