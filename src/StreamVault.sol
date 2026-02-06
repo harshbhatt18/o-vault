@@ -4,7 +4,6 @@ pragma solidity ^0.8.20;
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import {ContextUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol";
-import {Context} from "@openzeppelin/contracts/utils/Context.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -13,7 +12,6 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import {IYieldSource} from "./IYieldSource.sol";
-import {Multicall} from "@openzeppelin/contracts/utils/Multicall.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {IERC7540Redeem, IERC7540Operator} from "./interfaces/IERC7540.sol";
@@ -32,7 +30,6 @@ contract StreamVault is
     PausableUpgradeable,
     UUPSUpgradeable,
     EIP712,
-    Multicall,
     IERC7540Redeem
 {
     using SafeERC20 for IERC20;
@@ -50,8 +47,6 @@ contract StreamVault is
     uint256 public constant DEFAULT_MAX_DRAWDOWN_BPS = 1_000; // Default: 10% drawdown triggers pause
     uint256 public constant MAX_WITHDRAWAL_FEE_BPS = 100; // 1% max exit fee
     uint256 public constant MAX_LOCKUP_PERIOD = 7 days;
-    uint256 public constant MIN_TIMELOCK_DELAY = 1 hours;
-    uint256 public constant MAX_TIMELOCK_DELAY = 7 days;
 
     // ─── RBAC Role Constants ────────────────────────────────────────────
     bytes32 public constant ROLE_GUARDIAN = keccak256("ROLE_GUARDIAN");
@@ -76,11 +71,6 @@ contract StreamVault is
 
     struct WithdrawRequest {
         uint256 shares;
-    }
-
-    struct TimelockOp {
-        uint256 readyAt;
-        bytes32 dataHash;
     }
 
     // ─── State ──────────────────────────────────────────────────────────
@@ -124,11 +114,6 @@ contract StreamVault is
 
     uint256 public depositCap;
 
-    // ─── Feature: Timelock ────────────────────────────────────────────────
-
-    uint256 public timelockDelay;
-    mapping(bytes32 => TimelockOp) public timelockOps;
-
     // ─── Feature: Withdrawal Fee ──────────────────────────────────────────
 
     uint256 public withdrawalFeeBps;
@@ -142,10 +127,6 @@ contract StreamVault is
 
     bool public transfersRestricted;
     mapping(address => bool) public transferWhitelist;
-
-    // ─── Feature: Upgrade Timelock ────────────────────────────────────────
-
-    address private _pendingUpgradeImpl;
 
     // ─── Feature: EIP-7540 Operator ───────────────────────────────────────
 
@@ -187,10 +168,6 @@ contract StreamVault is
     event LockupPeriodUpdated(uint256 newPeriod);
     event TransfersRestrictionUpdated(bool restricted);
     event TransferWhitelistUpdated(address indexed account, bool whitelisted);
-    event TimelockScheduled(bytes32 indexed actionId, uint256 readyAt, bytes data);
-    event TimelockExecuted(bytes32 indexed actionId);
-    event TimelockCancelled(bytes32 indexed actionId);
-    event TimelockDelayUpdated(uint256 newDelay);
     event RoleGranted(bytes32 indexed role, address indexed account);
     event RoleRevoked(bytes32 indexed role, address indexed account);
     event TokenRescued(address indexed token, address indexed to, uint256 amount);
@@ -221,12 +198,6 @@ contract StreamVault is
     error LockupPeriodActive();
     error LockupPeriodTooLong();
     error TransferRestricted();
-    error TimelockRequired();
-    error TimelockNotScheduled();
-    error TimelockNotReady();
-    error TimelockAlreadyScheduled();
-    error TimelockDataMismatch();
-    error InvalidTimelockDelay();
     error ERC7540Unauthorized();
     error RescueUnderlyingForbidden();
     error SignatureExpired();
@@ -404,13 +375,11 @@ contract StreamVault is
 
     /// @notice Add a new yield source connector.
     function addYieldSource(IYieldSource source) external onlyOperator {
-        if (timelockDelay > 0) revert TimelockRequired();
         _addYieldSourceInternal(source);
     }
 
     /// @notice Remove a yield source. Must have zero balance.
     function removeYieldSource(uint256 sourceIndex) external onlyOperator {
-        if (timelockDelay > 0) revert TimelockRequired();
         _removeYieldSourceInternal(sourceIndex);
     }
 
@@ -724,7 +693,6 @@ contract StreamVault is
 
     /// @notice Update the management fee rate.
     function setManagementFee(uint256 _managementFeeBps) external onlyOperator {
-        if (timelockDelay > 0) revert TimelockRequired();
         _setManagementFeeInternal(_managementFeeBps);
     }
 
@@ -772,7 +740,6 @@ contract StreamVault is
 
     /// @notice Set the withdrawal fee in basis points (max 100 = 1%).
     function setWithdrawalFee(uint256 _withdrawalFeeBps) external onlyOperator {
-        if (timelockDelay > 0) revert TimelockRequired();
         _setWithdrawalFeeInternal(_withdrawalFeeBps);
     }
 
@@ -808,54 +775,6 @@ contract StreamVault is
             transferWhitelist[accounts[i]] = statuses[i];
             emit TransferWhitelistUpdated(accounts[i], statuses[i]);
         }
-    }
-
-    // ─── Feature: Timelock ────────────────────────────────────────────────
-
-    bytes32 public constant TIMELOCK_UPGRADE = keccak256("authorizeUpgrade");
-    bytes32 public constant TIMELOCK_SET_MGMT_FEE = keccak256("setManagementFee");
-    bytes32 public constant TIMELOCK_ADD_YIELD_SOURCE = keccak256("addYieldSource");
-    bytes32 public constant TIMELOCK_REMOVE_YIELD_SOURCE = keccak256("removeYieldSource");
-    bytes32 public constant TIMELOCK_SET_WITHDRAWAL_FEE = keccak256("setWithdrawalFee");
-    bytes32 public constant TIMELOCK_SET_DELAY = keccak256("setTimelockDelay");
-
-    /// @notice Schedule a timelocked action.
-    function scheduleAction(bytes32 actionId, bytes calldata data) external onlyOperator {
-        if (timelockDelay == 0) revert InvalidTimelockDelay();
-        TimelockOp storage op = timelockOps[actionId];
-        if (op.readyAt != 0) revert TimelockAlreadyScheduled();
-
-        uint256 readyAt = block.timestamp + timelockDelay;
-        op.readyAt = readyAt;
-        op.dataHash = keccak256(data);
-
-        emit TimelockScheduled(actionId, readyAt, data);
-    }
-
-    /// @notice Execute a scheduled action after the delay has passed.
-    function executeTimelocked(bytes32 actionId, bytes calldata data) external onlyOperator {
-        TimelockOp storage op = timelockOps[actionId];
-        if (op.readyAt == 0) revert TimelockNotScheduled();
-        if (block.timestamp < op.readyAt) revert TimelockNotReady();
-        if (keccak256(data) != op.dataHash) revert TimelockDataMismatch();
-
-        delete timelockOps[actionId];
-        emit TimelockExecuted(actionId);
-
-        _executeTimelocked(actionId, data);
-    }
-
-    /// @notice Cancel a scheduled action.
-    function cancelAction(bytes32 actionId) external onlyOperator {
-        if (timelockOps[actionId].readyAt == 0) revert TimelockNotScheduled();
-        delete timelockOps[actionId];
-        emit TimelockCancelled(actionId);
-    }
-
-    /// @notice Set the timelock delay. 0 = disabled.
-    function setTimelockDelay(uint256 _delay) external onlyOperator {
-        if (timelockDelay > 0) revert TimelockRequired();
-        _setTimelockDelayInternal(_delay);
     }
 
     // ─── Feature: EIP-7540 Async Redeem ───────────────────────────────────
@@ -930,11 +849,8 @@ contract StreamVault is
 
     // ─── UUPS Upgrade Authorization ──────────────────────────────────────
 
-    function _authorizeUpgrade(address newImplementation) internal override onlyOperator {
-        if (timelockDelay > 0) {
-            if (newImplementation != _pendingUpgradeImpl) revert TimelockNotScheduled();
-            _pendingUpgradeImpl = address(0);
-        }
+    function _authorizeUpgrade(address) internal override onlyOperator {
+        // Operator-only upgrade authorization
     }
 
     // ─── Internal Settlement Logic ───────────────────────────────────────
@@ -1065,30 +981,6 @@ contract StreamVault is
         return _domainSeparatorV4();
     }
 
-    // ─── Feature: Timelock Internal ──────────────────────────────────────
-
-    function _executeTimelocked(bytes32 actionId, bytes calldata data) internal {
-        if (actionId == TIMELOCK_SET_MGMT_FEE) {
-            uint256 feeBps = abi.decode(data, (uint256));
-            _setManagementFeeInternal(feeBps);
-        } else if (actionId == TIMELOCK_ADD_YIELD_SOURCE) {
-            address source = abi.decode(data, (address));
-            _addYieldSourceInternal(IYieldSource(source));
-        } else if (actionId == TIMELOCK_REMOVE_YIELD_SOURCE) {
-            uint256 sourceIndex = abi.decode(data, (uint256));
-            _removeYieldSourceInternal(sourceIndex);
-        } else if (actionId == TIMELOCK_SET_WITHDRAWAL_FEE) {
-            uint256 feeBps = abi.decode(data, (uint256));
-            _setWithdrawalFeeInternal(feeBps);
-        } else if (actionId == TIMELOCK_UPGRADE) {
-            address newImpl = abi.decode(data, (address));
-            _pendingUpgradeImpl = newImpl;
-        } else if (actionId == TIMELOCK_SET_DELAY) {
-            uint256 newDelay = abi.decode(data, (uint256));
-            _setTimelockDelayInternal(newDelay);
-        }
-    }
-
     function _addYieldSourceInternal(IYieldSource source) internal {
         if (address(source) == address(0)) revert ZeroAddress();
         if (source.asset() != asset()) revert AssetMismatch();
@@ -1129,27 +1021,6 @@ contract StreamVault is
         emit WithdrawalFeeUpdated(_withdrawalFeeBps);
     }
 
-    function _setTimelockDelayInternal(uint256 _delay) internal {
-        if (_delay != 0 && (_delay < MIN_TIMELOCK_DELAY || _delay > MAX_TIMELOCK_DELAY)) {
-            revert InvalidTimelockDelay();
-        }
-        timelockDelay = _delay;
-        emit TimelockDelayUpdated(_delay);
-    }
-
-    // ─── Context Override (diamond resolution) ────────────────────────────
-
-    function _msgSender() internal view override(ContextUpgradeable, Context) returns (address) {
-        return super._msgSender();
-    }
-
-    function _msgData() internal view override(ContextUpgradeable, Context) returns (bytes calldata) {
-        return super._msgData();
-    }
-
-    function _contextSuffixLength() internal view override(ContextUpgradeable, Context) returns (uint256) {
-        return super._contextSuffixLength();
-    }
 
     // ─── Internal Helpers ─────────────────────────────────────────────────
 

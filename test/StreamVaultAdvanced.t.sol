@@ -1386,14 +1386,18 @@ contract StreamVault_TransferRestrictions_Test is Test, ProxyDeployHelper {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Timelock
+// VaultTimelockController (External Timelock)
 // ─────────────────────────────────────────────────────────────────────────────
+
+import {VaultTimelockController} from "../src/VaultTimelockController.sol";
 
 contract StreamVault_Timelock_Test is Test, ProxyDeployHelper {
     MockERC20 usdc;
     StreamVault vault;
+    VaultTimelockController timelock;
     MockYieldSource yieldSource;
-    address operator = makeAddr("operator");
+    address vaultOperator = makeAddr("vaultOperator");
+    address timelockOwner = makeAddr("timelockOwner");
     address feeRecipient = makeAddr("feeRecipient");
     address alice = makeAddr("alice");
 
@@ -1401,310 +1405,149 @@ contract StreamVault_Timelock_Test is Test, ProxyDeployHelper {
 
     function setUp() public {
         usdc = new MockERC20("USDC", "USDC", 6);
-        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, "svUSDC", "svUSDC");
+        vault = _deployVaultProxy(IERC20(address(usdc)), vaultOperator, feeRecipient, 1000, 200, "svUSDC", "svUSDC");
         yieldSource = new MockYieldSource(address(usdc), address(vault), 1);
 
-        // Add yield source before enabling timelock
-        vm.prank(operator);
+        // Set up vault
+        vm.prank(vaultOperator);
         vault.addYieldSource(IYieldSource(address(yieldSource)));
-        vm.prank(operator);
+        vm.prank(vaultOperator);
         vault.setMaxDrawdown(0);
+
+        // Deploy timelock controller
+        timelock = new VaultTimelockController(address(vault), DELAY, timelockOwner);
+
+        // Transfer vault operator to timelock
+        vm.prank(vaultOperator);
+        vault.transferOperator(address(timelock));
+        vm.prank(address(timelock));
+        vault.acceptOperator();
     }
 
-    function test_setTimelockDelay_onlyOperator() public {
-        vm.prank(alice);
-        vm.expectRevert(StreamVault.OnlyOperator.selector);
-        vault.setTimelockDelay(DELAY);
+    function test_constructor_success() public view {
+        assertEq(timelock.vault(), address(vault));
+        assertEq(timelock.delay(), DELAY);
+        assertEq(timelock.owner(), timelockOwner);
     }
 
-    function test_setTimelockDelay_success() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-        assertEq(vault.timelockDelay(), DELAY);
+    function test_constructor_invalidDelay() public {
+        vm.expectRevert(VaultTimelockController.InvalidDelay.selector);
+        new VaultTimelockController(address(vault), 30 minutes, timelockOwner);
+
+        vm.expectRevert(VaultTimelockController.InvalidDelay.selector);
+        new VaultTimelockController(address(vault), 8 days, timelockOwner);
     }
 
-    function test_setTimelockDelay_invalidBounds() public {
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.InvalidTimelockDelay.selector);
-        vault.setTimelockDelay(30 minutes); // < MIN_TIMELOCK_DELAY
+    function test_schedule_success() public {
+        bytes memory data = abi.encodeCall(StreamVault.setManagementFee, (100));
 
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.InvalidTimelockDelay.selector);
-        vault.setTimelockDelay(8 days); // > MAX_TIMELOCK_DELAY
-    }
+        vm.prank(timelockOwner);
+        bytes32 opId = timelock.schedule(data);
 
-    function test_setTimelockDelay_zeroDisables() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        // Cannot directly set delay when timelock is active
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockRequired.selector);
-        vault.setTimelockDelay(0);
-
-        // Must go through timelock to disable
-        bytes memory data = abi.encode(uint256(0));
-        bytes32 actionId = vault.TIMELOCK_SET_DELAY();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
-
-        vm.warp(block.timestamp + DELAY);
-
-        vm.prank(operator);
-        vault.executeTimelocked(actionId, data);
-        assertEq(vault.timelockDelay(), 0);
-    }
-
-    function test_setTimelockDelay_revertsWhenActive() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        // Direct call reverts when timelock is active
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockRequired.selector);
-        vault.setTimelockDelay(2 hours);
-    }
-
-    function test_setTimelockDelay_changeViaTimelock() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        uint256 newDelay = 2 hours;
-        bytes memory data = abi.encode(newDelay);
-        bytes32 actionId = vault.TIMELOCK_SET_DELAY();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
-
-        vm.warp(block.timestamp + DELAY);
-
-        vm.prank(operator);
-        vault.executeTimelocked(actionId, data);
-        assertEq(vault.timelockDelay(), newDelay);
-    }
-
-    function test_scheduleAction_success() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        bytes memory data = abi.encode(uint256(100)); // 1% management fee
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
-
-        (uint256 readyAt,) = vault.timelockOps(actionId);
+        (uint256 readyAt, bytes32 dataHash) = timelock.getOperation(opId);
         assertEq(readyAt, block.timestamp + DELAY);
+        assertEq(dataHash, keccak256(data));
     }
 
-    function test_scheduleAction_revertsWhenTimelockDisabled() public {
-        bytes memory data = abi.encode(uint256(100));
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
+    function test_schedule_onlyOwner() public {
+        bytes memory data = abi.encodeCall(StreamVault.setManagementFee, (100));
 
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.InvalidTimelockDelay.selector);
-        vault.scheduleAction(actionId, data);
+        vm.prank(alice);
+        vm.expectRevert();
+        timelock.schedule(data);
     }
 
-    function test_scheduleAction_doubleScheduleReverts() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
+    function test_execute_success() public {
+        bytes memory data = abi.encodeCall(StreamVault.setManagementFee, (100));
 
-        bytes memory data = abi.encode(uint256(100));
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
-
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockAlreadyScheduled.selector);
-        vault.scheduleAction(actionId, data);
-    }
-
-    function test_executeTimelocked_success() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        bytes memory data = abi.encode(uint256(100));
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
+        vm.prank(timelockOwner);
+        bytes32 opId = timelock.schedule(data);
 
         vm.warp(block.timestamp + DELAY);
 
-        vm.prank(operator);
-        vault.executeTimelocked(actionId, data);
+        vm.prank(timelockOwner);
+        timelock.execute(opId, data);
 
         assertEq(vault.managementFeeBps(), 100);
     }
 
-    function test_executeTimelocked_tooEarlyReverts() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
+    function test_execute_tooEarly() public {
+        bytes memory data = abi.encodeCall(StreamVault.setManagementFee, (100));
 
-        bytes memory data = abi.encode(uint256(100));
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
+        vm.prank(timelockOwner);
+        bytes32 opId = timelock.schedule(data);
 
         vm.warp(block.timestamp + DELAY - 1);
 
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockNotReady.selector);
-        vault.executeTimelocked(actionId, data);
+        vm.prank(timelockOwner);
+        vm.expectRevert(VaultTimelockController.OperationNotReady.selector);
+        timelock.execute(opId, data);
     }
 
-    function test_executeTimelocked_dataMismatchReverts() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
+    function test_execute_dataMismatch() public {
+        bytes memory data = abi.encodeCall(StreamVault.setManagementFee, (100));
 
-        bytes memory data = abi.encode(uint256(100));
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
+        vm.prank(timelockOwner);
+        bytes32 opId = timelock.schedule(data);
 
         vm.warp(block.timestamp + DELAY);
 
-        bytes memory wrongData = abi.encode(uint256(200));
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockDataMismatch.selector);
-        vault.executeTimelocked(actionId, wrongData);
+        bytes memory wrongData = abi.encodeCall(StreamVault.setManagementFee, (200));
+        vm.prank(timelockOwner);
+        vm.expectRevert(VaultTimelockController.DataMismatch.selector);
+        timelock.execute(opId, wrongData);
     }
 
-    function test_executeTimelocked_notScheduledReverts() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
+    function test_cancel_success() public {
+        bytes memory data = abi.encodeCall(StreamVault.setManagementFee, (100));
 
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
-        bytes memory data = abi.encode(uint256(100));
+        vm.prank(timelockOwner);
+        bytes32 opId = timelock.schedule(data);
 
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockNotScheduled.selector);
-        vault.executeTimelocked(actionId, data);
-    }
+        vm.prank(timelockOwner);
+        timelock.cancel(opId);
 
-    function test_cancelAction_success() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        bytes memory data = abi.encode(uint256(100));
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
-
-        vm.prank(operator);
-        vault.cancelAction(actionId);
-
-        (uint256 readyAt,) = vault.timelockOps(actionId);
+        (uint256 readyAt,) = timelock.getOperation(opId);
         assertEq(readyAt, 0);
     }
 
-    function test_cancelAction_onlyOperator() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
+    function test_emergencyPause_bypassesTimelock() public {
+        vm.prank(timelockOwner);
+        timelock.emergencyPause();
 
-        bytes memory data = abi.encode(uint256(100));
-        bytes32 actionId = vault.TIMELOCK_SET_MGMT_FEE();
-
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
-
-        vm.prank(alice);
-        vm.expectRevert(StreamVault.OnlyOperator.selector);
-        vault.cancelAction(actionId);
-    }
-
-    function test_setManagementFee_revertsWhenTimelockActive() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockRequired.selector);
-        vault.setManagementFee(100);
-    }
-
-    function test_addYieldSource_revertsWhenTimelockActive() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        MockYieldSource ys2 = new MockYieldSource(address(usdc), address(vault), 1);
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockRequired.selector);
-        vault.addYieldSource(IYieldSource(address(ys2)));
-    }
-
-    function test_setWithdrawalFee_revertsWhenTimelockActive() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.TimelockRequired.selector);
-        vault.setWithdrawalFee(50);
-    }
-
-    function test_pause_noTimelockRequired() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
-
-        // Pause should work without timelock
-        vm.prank(operator);
-        vault.pause();
         assertTrue(vault.paused());
     }
 
-    function test_unpause_noTimelockRequired() public {
-        vm.prank(operator);
-        vault.pause();
+    function test_emergencyUnpause_bypassesTimelock() public {
+        vm.prank(timelockOwner);
+        timelock.emergencyPause();
 
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
+        vm.prank(timelockOwner);
+        timelock.emergencyUnpause();
 
-        // Unpause should work without timelock
-        vm.prank(operator);
-        vault.unpause();
         assertFalse(vault.paused());
     }
 
-    function test_addYieldSource_viaTimelock() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
+    function test_setDelay_success() public {
+        uint256 newDelay = 2 days;
 
-        MockYieldSource ys2 = new MockYieldSource(address(usdc), address(vault), 1);
-        bytes memory data = abi.encode(address(ys2));
-        bytes32 actionId = vault.TIMELOCK_ADD_YIELD_SOURCE();
+        vm.prank(timelockOwner);
+        timelock.setDelay(newDelay);
 
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
-
-        vm.warp(block.timestamp + DELAY);
-
-        vm.prank(operator);
-        vault.executeTimelocked(actionId, data);
-
-        assertEq(vault.yieldSourceCount(), 2);
+        assertEq(timelock.delay(), newDelay);
     }
 
-    function test_setWithdrawalFee_viaTimelock() public {
-        vm.prank(operator);
-        vault.setTimelockDelay(DELAY);
+    function test_isOperationReady() public {
+        bytes memory data = abi.encodeCall(StreamVault.setManagementFee, (100));
 
-        bytes memory data = abi.encode(uint256(50));
-        bytes32 actionId = vault.TIMELOCK_SET_WITHDRAWAL_FEE();
+        vm.prank(timelockOwner);
+        bytes32 opId = timelock.schedule(data);
 
-        vm.prank(operator);
-        vault.scheduleAction(actionId, data);
+        assertFalse(timelock.isOperationReady(opId));
 
         vm.warp(block.timestamp + DELAY);
 
-        vm.prank(operator);
-        vault.executeTimelocked(actionId, data);
-
-        assertEq(vault.withdrawalFeeBps(), 50);
+        assertTrue(timelock.isOperationReady(opId));
     }
 }
 
@@ -2117,47 +1960,6 @@ contract StreamVault_Rescuable_Test is Test, ProxyDeployHelper {
         vault.rescueToken(IERC20(address(randomToken)), alice, 500e18);
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Multicall
-// ─────────────────────────────────────────────────────────────────────────────
-
-contract StreamVault_Multicall_Test is Test, ProxyDeployHelper {
-    MockERC20 usdc;
-    StreamVault vault;
-    address operator = makeAddr("operator");
-    address feeRecipient = makeAddr("feeRecipient");
-
-    function setUp() public {
-        usdc = new MockERC20("USDC", "USDC", 6);
-        vault = _deployVaultProxy(IERC20(address(usdc)), operator, feeRecipient, 1000, 200, "svUSDC", "svUSDC");
-    }
-
-    function test_multicall_batchAdminCalls() public {
-        bytes[] memory calls = new bytes[](3);
-        calls[0] = abi.encodeCall(StreamVault.setDepositCap, (10_000_000e6));
-        calls[1] = abi.encodeCall(StreamVault.setLockupPeriod, (1 days));
-        calls[2] = abi.encodeCall(StreamVault.setMaxDrawdown, (1500));
-
-        vm.prank(operator);
-        vault.multicall(calls);
-
-        assertEq(vault.depositCap(), 10_000_000e6);
-        assertEq(vault.lockupPeriod(), 1 days);
-        assertEq(vault.maxDrawdownBps(), 1500);
-    }
-
-    function test_multicall_revertsIfOneCallFails() public {
-        bytes[] memory calls = new bytes[](2);
-        calls[0] = abi.encodeCall(StreamVault.setDepositCap, (10_000_000e6));
-        calls[1] = abi.encodeCall(StreamVault.setLockupPeriod, (30 days)); // exceeds MAX_LOCKUP_PERIOD
-
-        vm.prank(operator);
-        vm.expectRevert(StreamVault.LockupPeriodTooLong.selector);
-        vault.multicall(calls);
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // FeeLib
 // ─────────────────────────────────────────────────────────────────────────────
