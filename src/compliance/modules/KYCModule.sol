@@ -29,7 +29,6 @@ contract KYCModule is IComplianceModule, Ownable2Step {
         VERIFIED, // Active and verified
         EXPIRED, // Was verified, now expired
         REVOKED // Manually revoked
-
     }
 
     struct KYCRecord {

@@ -29,7 +29,6 @@ contract AccreditedInvestorModule is IComplianceModule, Ownable2Step {
         ACCREDITED, // Accredited individual ($1M+ net worth or $200k+ income)
         QUALIFIED, // Qualified purchaser ($5M+ investments)
         INSTITUTIONAL // Institutional investor
-
     }
 
     struct VaultRequirements {

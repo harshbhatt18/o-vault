@@ -553,7 +553,9 @@ contract ComplianceRouter_Test is ComplianceTestBase {
 
     // ─── Fuzz Tests ───
 
-    function testFuzz_multipleModulesChained(bool kycEnabled, bool geoEnabled, bool hasKYC, bool blockedCountry) public {
+    function testFuzz_multipleModulesChained(bool kycEnabled, bool geoEnabled, bool hasKYC, bool blockedCountry)
+        public
+    {
         if (kycEnabled) {
             kycModule.setVaultMinTier(address(vault), 1);
         }
@@ -788,9 +790,7 @@ contract Compliance_Invariant_Test is StdInvariant, ComplianceTestBase {
         vault.setComplianceRouter(address(router));
 
         // Create handler
-        handler = new ComplianceHandler(
-            usdc, vault, router, kycModule, accreditedModule, geofenceModule, attester
-        );
+        handler = new ComplianceHandler(usdc, vault, router, kycModule, accreditedModule, geofenceModule, attester);
 
         // Target the handler
         targetContract(address(handler));

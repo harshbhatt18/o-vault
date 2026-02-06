@@ -383,10 +383,7 @@ contract StreamVault is
     }
 
     /// @notice Mint exact shares with slippage protection on assets spent.
-    function mintWithSlippage(uint256 shares, address receiver, uint256 maxAssetsIn)
-        external
-        returns (uint256 assets)
-    {
+    function mintWithSlippage(uint256 shares, address receiver, uint256 maxAssetsIn) external returns (uint256 assets) {
         assets = mint(shares, receiver);
         if (assets > maxAssetsIn) {
             revert SlippageExceeded(assets, maxAssetsIn);

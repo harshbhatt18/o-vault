@@ -38,13 +38,7 @@ abstract contract StreamVaultTestBase is Test {
         usdc = new MockERC20("USD Coin", "USDC", 6);
 
         vault = _deployVault(
-            IERC20(address(usdc)),
-            operator,
-            feeRecipient,
-            PERF_FEE_BPS,
-            MGMT_FEE_BPS,
-            "StreamVault USDC",
-            "svUSDC"
+            IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, MGMT_FEE_BPS, "StreamVault USDC", "svUSDC"
         );
 
         // Deploy mock yield source wired to vault (proxy address)
@@ -132,8 +126,7 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
     function test_revert_perfFeeTooHigh() public {
         StreamVault impl = new StreamVault();
         bytes memory initData = abi.encodeCall(
-            StreamVault.initialize,
-            (IERC20(address(usdc)), operator, feeRecipient, 5_001, MGMT_FEE_BPS, "V", "V")
+            StreamVault.initialize, (IERC20(address(usdc)), operator, feeRecipient, 5_001, MGMT_FEE_BPS, "V", "V")
         );
         vm.expectRevert(StreamVault.FeeTooHigh.selector);
         new ERC1967Proxy(address(impl), initData);
@@ -142,16 +135,14 @@ contract StreamVault_Constructor_Test is StreamVaultTestBase {
     function test_revert_mgmtFeeTooHigh() public {
         StreamVault impl = new StreamVault();
         bytes memory initData = abi.encodeCall(
-            StreamVault.initialize,
-            (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 501, "V", "V")
+            StreamVault.initialize, (IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 501, "V", "V")
         );
         vm.expectRevert(StreamVault.FeeTooHigh.selector);
         new ERC1967Proxy(address(impl), initData);
     }
 
     function test_boundaryValues_perfFeeMax() public {
-        StreamVault v =
-            _deployVault(IERC20(address(usdc)), operator, feeRecipient, 5_000, MGMT_FEE_BPS, "V", "V");
+        StreamVault v = _deployVault(IERC20(address(usdc)), operator, feeRecipient, 5_000, MGMT_FEE_BPS, "V", "V");
         assertEq(v.performanceFeeBps(), 5_000);
     }
 }
@@ -668,8 +659,7 @@ contract StreamVault_ManagementFee_Test is StreamVaultTestBase {
     }
 
     function test_mgmtFee_zeroFee_noAccrual() public {
-        StreamVault v2 =
-            _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 0, "V2", "V2");
+        StreamVault v2 = _deployVault(IERC20(address(usdc)), operator, feeRecipient, PERF_FEE_BPS, 0, "V2", "V2");
 
         usdc.mint(alice, INITIAL_DEPOSIT);
         vm.startPrank(alice);
@@ -1613,7 +1603,9 @@ contract StreamVault_SlippageProtection_Test is StreamVaultTestBase {
         usdc.mint(alice, amount);
         vm.startPrank(alice);
         usdc.approve(address(vault), amount);
-        vm.expectRevert(abi.encodeWithSelector(StreamVault.SlippageExceeded.selector, expectedShares, unreasonablyHighMin));
+        vm.expectRevert(
+            abi.encodeWithSelector(StreamVault.SlippageExceeded.selector, expectedShares, unreasonablyHighMin)
+        );
         vault.depositWithSlippage(amount, alice, unreasonablyHighMin);
         vm.stopPrank();
     }
@@ -1640,7 +1632,9 @@ contract StreamVault_SlippageProtection_Test is StreamVaultTestBase {
         usdc.mint(alice, expectedAssets);
         vm.startPrank(alice);
         usdc.approve(address(vault), expectedAssets);
-        vm.expectRevert(abi.encodeWithSelector(StreamVault.SlippageExceeded.selector, expectedAssets, unreasonablyLowMax));
+        vm.expectRevert(
+            abi.encodeWithSelector(StreamVault.SlippageExceeded.selector, expectedAssets, unreasonablyLowMax)
+        );
         vault.mintWithSlippage(sharesToMint, alice, unreasonablyLowMax);
         vm.stopPrank();
     }

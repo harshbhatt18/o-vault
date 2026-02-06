@@ -724,9 +724,7 @@ contract StreamVault_ComprehensiveInvariant_Test is StdInvariant, Test {
         for (uint256 i; i < handler.NUM_ACTORS(); ++i) {
             address actor = handler.actors(i);
             assertEq(
-                vault.transferWhitelist(actor),
-                handler.ghostWhitelistedAddresses(actor),
-                "Whitelist state mismatch"
+                vault.transferWhitelist(actor), handler.ghostWhitelistedAddresses(actor), "Whitelist state mismatch"
             );
         }
     }
